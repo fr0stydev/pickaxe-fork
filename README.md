@@ -117,9 +117,3 @@ Artifacts:
 
 Load `powerpick-fork.axs` in Adaptix. Registered for beacon / gopher / kharon,
 Windows x64.
-
-## Success criteria
-
-- `powerpick-fork "Get-Date"` returns output and the agent stays alive.
-- Process image is `rundll32.exe` (not `powershell.exe`).
-- Killing / crashing the sacrificial host does not terminate the agent.
