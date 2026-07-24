@@ -4,8 +4,7 @@ Fork-and-run PowerShell for AdaptixC2 agents. Runs the SMA host inside a
 **sacrificial Microsoft-signed process** so a CLR / PowerShell crash does not
 kill the agent.
 
-This tree is separate from inline PowerPick (`powerpick-bof`). Do not edit that
-project while working here.
+This tree is separate from inline PowerPick (`powerpick-bof`).
 
 ## How it differs from inline PowerPick
 
