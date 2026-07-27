@@ -154,18 +154,6 @@ function powerpick_fork_session_remove(name) {
     return true;
 }
 
-function powerpick_fork_unquote(value) {
-    if (!value || value.length < 2) {
-        return value;
-    }
-    let first = value.charAt(0);
-    let last = value.charAt(value.length - 1);
-    if ((first == '"' && last == '"') || (first == "'" && last == "'")) {
-        return value.substring(1, value.length - 1);
-    }
-    return value;
-}
-
 function powerpick_fork_normalize_spawnto(spawnto) {
     if (!spawnto || spawnto.length == 0 || spawnto == "--spawnto") {
         return powerpick_fork_default_spawnto;
@@ -178,61 +166,6 @@ function powerpick_fork_normalize_spawnto(spawnto) {
     }
 
     return spawnto;
-}
-
-/*
- * Parse: powerpick [--imports] [--impersonate] [--spawnto PATH] <powershell>
- * Flags may appear in either order before the expression.
- */
-function powerpick_fork_parse_cmdline(cmdline) {
-    let rest = cmdline.replace(/^\s*powerpick\s+/i, "").trim();
-    if (rest.length == 0) {
-        throw new Error("PowerShell command is empty");
-    }
-
-    let spawnto = powerpick_fork_default_spawnto;
-    let use_imports = false;
-    let use_impersonate = false;
-    let powershell = rest;
-
-    while (true) {
-        let importsMatch = powershell.match(/^--imports(?:\s+|$)([\s\S]*)$/i);
-        if (importsMatch) {
-            use_imports = true;
-            powershell = importsMatch[1].trim();
-            continue;
-        }
-
-        let impersonateMatch = powershell.match(/^--impersonate(?:\s+|$)([\s\S]*)$/i);
-        if (impersonateMatch) {
-            use_impersonate = true;
-            powershell = impersonateMatch[1].trim();
-            continue;
-        }
-
-        let spawntoMatch = powershell.match(
-            /^--spawnto\s+("([^"]*)"|'([^']*)'|(\S+))\s+([\s\S]+)$/i
-        );
-        if (spawntoMatch) {
-            spawnto = spawntoMatch[2] || spawntoMatch[3] || spawntoMatch[4];
-            powershell = spawntoMatch[5].trim();
-            continue;
-        }
-
-        break;
-    }
-
-    powershell = powerpick_fork_unquote(powershell.trim());
-    if (!powershell || powershell.length == 0) {
-        throw new Error("PowerShell command is empty");
-    }
-
-    return {
-        spawnto: powerpick_fork_normalize_spawnto(spawnto),
-        powershell: powershell,
-        use_imports: use_imports,
-        use_impersonate: use_impersonate
-    };
 }
 
 function powerpick_fork_run_exec(
@@ -285,8 +218,27 @@ function powerpick_fork_run_exec(
 
 var cmd_powerpick = ax.create_command(
     "powerpick",
-    "Execute PowerShell in a sacrificial process (default rundll32)",
-    "powerpick [--imports] [--impersonate] [--spawnto PATH] \"Get-Date\""
+    "Run PowerShell in a sacrificial process (default rundll32)",
+    "powerpick [--imports] [--impersonate] [--spawnto PATH] <powershell>"
+);
+cmd_powerpick.addArgBool(
+    "--imports",
+    "Re-apply all session-loaded scripts before the expression"
+);
+cmd_powerpick.addArgBool(
+    "--impersonate",
+    "Spawn under the current thread impersonation token (steal_token / make_token)"
+);
+cmd_powerpick.addArgFlagString(
+    "--spawnto",
+    "spawnto",
+    false,
+    "Sacrificial process path (default: C:\\Windows\\System32\\rundll32.exe)"
+);
+cmd_powerpick.addArgString(
+    "powershell",
+    true,
+    "PowerShell command or expression to run"
 );
 
 cmd_powerpick.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
@@ -294,8 +246,13 @@ cmd_powerpick.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
         throw new Error("powerpick currently supports x64 agents only");
     }
 
-    let parsed = powerpick_fork_parse_cmdline(cmdline);
-    let encoded_script = ax.encode_data("base64", parsed.powershell);
+    let powershell = parsed_json["powershell"];
+    if (!powershell || powershell.length == 0) {
+        throw new Error("PowerShell command is empty");
+    }
+
+    let spawnto = powerpick_fork_normalize_spawnto(parsed_json["spawnto"]);
+    let encoded_script = ax.encode_data("base64", powershell);
     let command_bytes = powerpick_fork_b64_raw_bytes(encoded_script);
     if (command_bytes > powerpick_fork_operator_max_bytes) {
         throw new Error("command exceeds the 2 MiB operator limit");
@@ -304,27 +261,27 @@ cmd_powerpick.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
     powerpick_fork_run_exec(
         id,
         cmdline,
-        parsed.spawnto,
+        spawnto,
         encoded_script,
-        parsed.use_imports,
-        parsed.use_impersonate
+        !!parsed_json["--imports"],
+        !!parsed_json["--impersonate"]
     );
 });
 
 var cmd_powerpick_load = ax.create_command(
     "powerpick-load",
     "Load a local PowerShell script into the session and cache it on the agent",
-    "powerpick-load /path/to/module.ps1 [name]"
+    "powerpick-load <script.ps1> [name]"
 );
 cmd_powerpick_load.addArgFile(
     "script",
     true,
-    "Local path to a PowerShell script that defines functions"
+    "Local path to a PowerShell script (.ps1) that defines functions"
 );
 cmd_powerpick_load.addArgString(
     "name",
-    "Session import name (defaults to the script basename)",
-    ""
+    false,
+    "Optional session import name (default: script basename)"
 );
 
 cmd_powerpick_load.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
@@ -419,7 +376,7 @@ cmd_powerpick_load.setPreHook(function (id, cmdline, parsed_json, ...parsed_line
 
 var cmd_powerpick_loads = ax.create_command(
     "powerpick-loads",
-    "List PowerShell scripts loaded into the powerpick session",
+    "List PowerShell scripts currently loaded in the session",
     "powerpick-loads"
 );
 
@@ -453,13 +410,13 @@ cmd_powerpick_loads.setPreHook(function (id, cmdline, parsed_json, ...parsed_lin
 
 var cmd_powerpick_unload = ax.create_command(
     "powerpick-unload",
-    "Remove a session import by name, or all session imports",
+    "Remove a cached session import by name, or clear all imports",
     "powerpick-unload <name|all>"
 );
 cmd_powerpick_unload.addArgString(
     "name",
     true,
-    "Session import name, or 'all'"
+    "Import name to drop, or 'all' to clear every session import"
 );
 
 cmd_powerpick_unload.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {

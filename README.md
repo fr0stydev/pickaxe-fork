@@ -59,9 +59,11 @@ sacrificial process before the command. Script bodies are cached on the agent by
 `powerpick-load`; `--imports` only sends import names on the wire.
 
 `--impersonate` spawns the sacrificial process with
-`CreateProcessAsUser` using the agent thread’s current impersonation token
-(e.g. after `steal_token` / `make_token`). Without it, the child runs as the
-agent’s primary identity. Errors if no thread token is present.
+`CreateProcessWithTokenW` (falls back to `CreateProcessAsUser`) using the
+agent thread’s current impersonation token (e.g. after `steal_token` /
+`make_token`). Requires `SeImpersonatePrivilege` on the agent. Without the
+flag, the child runs as the agent’s primary identity; if a thread token is
+present it is temporarily reverted for the spawn so the agent does not crash.
 
 `--spawnto` / `--imports` / `--impersonate` are parsed from the raw command line.
 A bare spawnto image name is expanded under `C:\Windows\System32\`.
