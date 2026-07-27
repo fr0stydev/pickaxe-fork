@@ -59,6 +59,7 @@ WINBASEAPI void WINAPI KERNEL32$SetLastError(DWORD dwErrCode);
 WINBASEAPI HMODULE WINAPI KERNEL32$GetModuleHandleA(LPCSTR lpModuleName);
 WINBASEAPI FARPROC WINAPI KERNEL32$GetProcAddress(HMODULE hModule, LPCSTR lpProcName);
 WINBASEAPI DWORD WINAPI KERNEL32$GetTempPathA(DWORD nBufferLength, LPSTR lpBuffer);
+WINBASEAPI UINT WINAPI KERNEL32$GetWindowsDirectoryA(LPSTR lpBuffer, UINT uSize);
 WINBASEAPI HANDLE WINAPI KERNEL32$CreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
 WINBASEAPI BOOL WINAPI KERNEL32$WriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped);
 WINBASEAPI BOOL WINAPI KERNEL32$DeleteFileA(LPCSTR lpFileName);
@@ -67,5 +68,11 @@ WINBASEAPI BOOL WINAPI KERNEL32$FreeEnvironmentStringsW(LPWCH penv);
 WINBASEAPI int WINAPI KERNEL32$MultiByteToWideChar(UINT CodePage, DWORD dwFlags, LPCCH lpMultiByteStr, int cbMultiByte, LPWSTR lpWideCharStr, int cchWideChar);
 WINBASEAPI int WINAPI KERNEL32$lstrlenW(LPCWSTR lpString);
 WINBASEAPI HMODULE WINAPI KERNEL32$LoadLibraryA(LPCSTR lpLibFileName);
+WINBASEAPI HANDLE WINAPI KERNEL32$GetCurrentThread(VOID);
+
+/* ADVAPI32 — optional --impersonate spawn */
+WINBASEAPI BOOL WINAPI ADVAPI32$OpenThreadToken(HANDLE ThreadHandle, DWORD DesiredAccess, BOOL OpenAsSelf, PHANDLE TokenHandle);
+WINBASEAPI BOOL WINAPI ADVAPI32$DuplicateTokenEx(HANDLE hExistingToken, DWORD dwDesiredAccess, LPSECURITY_ATTRIBUTES lpTokenAttributes, SECURITY_IMPERSONATION_LEVEL ImpersonationLevel, TOKEN_TYPE TokenType, PHANDLE phNewToken);
+WINBASEAPI BOOL WINAPI ADVAPI32$CreateProcessAsUserW(HANDLE hToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes, LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation);
 
 typedef BOOLEAN(WINAPI* RTLGENRANDOM)(PVOID, ULONG);

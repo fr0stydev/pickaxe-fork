@@ -67,9 +67,9 @@ function powerpick_fork_session_find(name) {
 }
 
 // Derive a session import name from the load command line path.
-// e.g. powerpick-fork-load ~/opt/PowerView.ps1 → "powerview"
+// e.g. powerpick-load ~/opt/PowerView.ps1 → "powerview"
 function powerpick_fork_default_import_name(cmdline) {
-    let rest = (cmdline || "").replace(/^\s*powerpick-fork-load\s+/i, "").trim();
+    let rest = (cmdline || "").replace(/^\s*powerpick-load\s+/i, "").trim();
     if (rest.length == 0) {
         return "";
     }
@@ -181,17 +181,18 @@ function powerpick_fork_normalize_spawnto(spawnto) {
 }
 
 /*
- * Parse: powerpick-fork [--imports] [--spawnto PATH] <powershell>
+ * Parse: powerpick [--imports] [--impersonate] [--spawnto PATH] <powershell>
  * Flags may appear in either order before the expression.
  */
 function powerpick_fork_parse_cmdline(cmdline) {
-    let rest = cmdline.replace(/^\s*powerpick-fork\s+/i, "").trim();
+    let rest = cmdline.replace(/^\s*powerpick\s+/i, "").trim();
     if (rest.length == 0) {
         throw new Error("PowerShell command is empty");
     }
 
     let spawnto = powerpick_fork_default_spawnto;
     let use_imports = false;
+    let use_impersonate = false;
     let powershell = rest;
 
     while (true) {
@@ -199,6 +200,13 @@ function powerpick_fork_parse_cmdline(cmdline) {
         if (importsMatch) {
             use_imports = true;
             powershell = importsMatch[1].trim();
+            continue;
+        }
+
+        let impersonateMatch = powershell.match(/^--impersonate(?:\s+|$)([\s\S]*)$/i);
+        if (impersonateMatch) {
+            use_impersonate = true;
+            powershell = impersonateMatch[1].trim();
             continue;
         }
 
@@ -222,11 +230,19 @@ function powerpick_fork_parse_cmdline(cmdline) {
     return {
         spawnto: powerpick_fork_normalize_spawnto(spawnto),
         powershell: powershell,
-        use_imports: use_imports
+        use_imports: use_imports,
+        use_impersonate: use_impersonate
     };
 }
 
-function powerpick_fork_run_exec(id, cmdline, spawnto, encoded_script, use_imports) {
+function powerpick_fork_run_exec(
+    id,
+    cmdline,
+    spawnto,
+    encoded_script,
+    use_imports,
+    use_impersonate
+) {
     let artifacts = powerpick_fork_require_artifacts(ax.script_dir());
     let host_bytes = ax.file_read(artifacts.host_path);
     let managed_bytes = ax.file_read(artifacts.managed_path);
@@ -235,17 +251,27 @@ function powerpick_fork_run_exec(id, cmdline, spawnto, encoded_script, use_impor
 
     if (use_imports) {
         if (powerpick_fork_session_imports.length == 0) {
-            throw new Error("no session imports loaded; run powerpick-fork-load first");
+            throw new Error("no session imports loaded; run powerpick-load first");
         }
         for (let index = 0; index < powerpick_fork_session_imports.length; index++) {
             managed_args += " " + powerpick_fork_session_imports[index].name;
         }
         suffix = ` +${powerpick_fork_session_imports.length} import(s)`;
     }
+    if (use_impersonate) {
+        suffix += " +impersonate";
+    }
 
     let bof_params = ax.bof_pack(
-        "cstr,cstr,bytes,bytes,cstr",
-        ["exec", spawnto, host_bytes, managed_bytes, managed_args]
+        "cstr,cstr,bytes,bytes,cstr,cstr",
+        [
+            "exec",
+            spawnto,
+            host_bytes,
+            managed_bytes,
+            managed_args,
+            use_impersonate ? "1" : "0"
+        ]
     );
     let command = `execute bof "${artifacts.bof_path}" ${bof_params}`;
 
@@ -253,19 +279,19 @@ function powerpick_fork_run_exec(id, cmdline, spawnto, encoded_script, use_impor
         id,
         cmdline,
         command,
-        `Task: PowerShell fork (${spawnto})` + suffix
+        `Task: PowerShell (${spawnto})` + suffix
     );
 }
 
-var cmd_powerpick_fork = ax.create_command(
-    "powerpick-fork",
+var cmd_powerpick = ax.create_command(
+    "powerpick",
     "Execute PowerShell in a sacrificial process (default rundll32)",
-    "powerpick-fork [--imports] [--spawnto PATH] \"Get-Date\""
+    "powerpick [--imports] [--impersonate] [--spawnto PATH] \"Get-Date\""
 );
 
-cmd_powerpick_fork.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
+cmd_powerpick.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
     if (!ax.is64(id)) {
-        throw new Error("powerpick-fork currently supports x64 agents only");
+        throw new Error("powerpick currently supports x64 agents only");
     }
 
     let parsed = powerpick_fork_parse_cmdline(cmdline);
@@ -280,29 +306,30 @@ cmd_powerpick_fork.setPreHook(function (id, cmdline, parsed_json, ...parsed_line
         cmdline,
         parsed.spawnto,
         encoded_script,
-        parsed.use_imports
+        parsed.use_imports,
+        parsed.use_impersonate
     );
 });
 
-var cmd_powerpick_fork_load = ax.create_command(
-    "powerpick-fork-load",
-    "Load a local PowerShell script into the fork session and cache it on the agent",
-    "powerpick-fork-load /path/to/module.ps1 [name]"
+var cmd_powerpick_load = ax.create_command(
+    "powerpick-load",
+    "Load a local PowerShell script into the session and cache it on the agent",
+    "powerpick-load /path/to/module.ps1 [name]"
 );
-cmd_powerpick_fork_load.addArgFile(
+cmd_powerpick_load.addArgFile(
     "script",
     true,
     "Local path to a PowerShell script that defines functions"
 );
-cmd_powerpick_fork_load.addArgString(
+cmd_powerpick_load.addArgString(
     "name",
     "Session import name (defaults to the script basename)",
     ""
 );
 
-cmd_powerpick_fork_load.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
+cmd_powerpick_load.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
     if (!ax.is64(id)) {
-        throw new Error("powerpick-fork currently supports x64 agents only");
+        throw new Error("powerpick currently supports x64 agents only");
     }
 
     let encoded_script = parsed_json["script"];
@@ -385,24 +412,24 @@ cmd_powerpick_fork_load.setPreHook(function (id, cmdline, parsed_json, ...parsed
         id,
         cmdline,
         command,
-        `Task: cache fork session import (${name}, ${bytes} bytes)`,
+        `Task: cache session import (${name}, ${bytes} bytes)`,
         hook
     );
 });
 
-var cmd_powerpick_fork_loads = ax.create_command(
-    "powerpick-fork-loads",
-    "List PowerShell scripts loaded into the powerpick-fork session",
-    "powerpick-fork-loads"
+var cmd_powerpick_loads = ax.create_command(
+    "powerpick-loads",
+    "List PowerShell scripts loaded into the powerpick session",
+    "powerpick-loads"
 );
 
-cmd_powerpick_fork_loads.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
+cmd_powerpick_loads.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
     if (powerpick_fork_session_imports.length == 0) {
         ax.console_message(
             id,
             "No session imports loaded\n",
             "info",
-            "Use powerpick-fork-load SCRIPT [name] to add one."
+            "Use powerpick-load SCRIPT [name] to add one."
         );
         return;
     }
@@ -418,26 +445,26 @@ cmd_powerpick_fork_loads.setPreHook(function (id, cmdline, parsed_json, ...parse
 
     ax.console_message(
         id,
-        `Fork session imports (${powerpick_fork_session_imports.length})\n`,
+        `Session imports (${powerpick_fork_session_imports.length})\n`,
         "info",
         lines
     );
 });
 
-var cmd_powerpick_fork_unload = ax.create_command(
-    "powerpick-fork-unload",
-    "Remove a fork session import by name, or all session imports",
-    "powerpick-fork-unload <name|all>"
+var cmd_powerpick_unload = ax.create_command(
+    "powerpick-unload",
+    "Remove a session import by name, or all session imports",
+    "powerpick-unload <name|all>"
 );
-cmd_powerpick_fork_unload.addArgString(
+cmd_powerpick_unload.addArgString(
     "name",
     true,
     "Session import name, or 'all'"
 );
 
-cmd_powerpick_fork_unload.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
+cmd_powerpick_unload.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines) {
     if (!ax.is64(id)) {
-        throw new Error("powerpick-fork currently supports x64 agents only");
+        throw new Error("powerpick currently supports x64 agents only");
     }
 
     let name = parsed_json["name"];
@@ -466,7 +493,7 @@ cmd_powerpick_fork_unload.setPreHook(function (id, cmdline, parsed_json, ...pars
             id,
             cmdline,
             command,
-            `Task: drop ${names.length} cached fork session import(s)`
+            `Task: drop ${names.length} cached session import(s)`
         );
         return;
     }
@@ -481,22 +508,22 @@ cmd_powerpick_fork_unload.setPreHook(function (id, cmdline, parsed_json, ...pars
         id,
         cmdline,
         command,
-        `Task: drop cached fork session import (${name})`
+        `Task: drop cached session import (${name})`
     );
 });
 
-var group_powerpick_fork = ax.create_commands_group(
-    "PowerPick-Fork",
+var group_powerpick = ax.create_commands_group(
+    "PowerPick",
     [
-        cmd_powerpick_fork,
-        cmd_powerpick_fork_load,
-        cmd_powerpick_fork_loads,
-        cmd_powerpick_fork_unload
+        cmd_powerpick,
+        cmd_powerpick_load,
+        cmd_powerpick_loads,
+        cmd_powerpick_unload
     ]
 );
 
 ax.register_commands_group(
-    group_powerpick_fork,
+    group_powerpick,
     ["beacon", "gopher", "kharon"],
     ["windows"],
     []

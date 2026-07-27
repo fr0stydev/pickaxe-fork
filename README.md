@@ -5,7 +5,9 @@ Fork-and-run PowerShell for AdaptixC2 agents. Runs the SMA host inside a
 kill the agent.
 Lab / authorized testing only.
 
-This tree is separate from inline PowerPick (`powerpick-bof`).
+This tree is separate from inline PowerPick (`powerpick-bof`). Operator commands
+are the same (`powerpick`, `powerpick-load`, …) — **load only one** of the two
+AxScripts at a time.
 
 ## How it differs from inline PowerPick
 
@@ -14,7 +16,7 @@ This tree is separate from inline PowerPick (`powerpick-bof`).
 | Where CLR runs | Inside the agent process | Sacrificial `rundll32` process |
 | Crash impact | Can kill the agent | Sacrificial process dies; agent continues |
 | Vessel | Agent image | Default `rundll32.exe` (configurable) |
-| Session imports | `powerpick-load` / `--imports` | `powerpick-fork-load` / `--imports` |
+| Commands | `powerpick` / `powerpick-load` / `--imports` | Same |
 
 ## OPSEC
 
@@ -28,34 +30,42 @@ script-block logging, or behavioral AV on `rundll32` / CLR load.
 ## Command
 
 ```text
-powerpick-fork [--imports] [--spawnto PATH] <powershell>
-powerpick-fork-load /path/to/script.ps1 [name]
-powerpick-fork-loads (Checks what scripts been loaded.)
-powerpick-fork-unload <name|all>
+powerpick [--imports] [--impersonate] [--spawnto PATH] <powershell>
+powerpick-load /path/to/script.ps1 [name]
+powerpick-loads
+powerpick-unload <name|all>
 ```
 
 Examples:
 
 ```text
-powerpick-fork "Get-Date"
-powerpick-fork ls
-powerpick-fork --spawnto rundll32.exe "Get-Date"
+powerpick "Get-Date"
+powerpick ls
+powerpick --spawnto rundll32.exe "Get-Date"
+powerpick --impersonate whoami
+powerpick --imports --impersonate Get-DomainComputer
 
-powerpick-fork-load ~/opt/PowerView.ps1
-powerpick-fork-load ~/opt/PowerView.ps1 recon
-powerpick-fork --imports Get-ComputerInfo
+powerpick-load ~/opt/PowerView.ps1
+powerpick-load ~/opt/PowerView.ps1 recon
+powerpick --imports Get-ComputerInfo
 ```
 
-`powerpick-fork-load` defaults the import name to the script basename
+`powerpick-load` defaults the import name to the script basename
 (`PowerView.ps1` → `powerview`). Pass a second argument to override. Reloading the
 same name replaces the cached body.
 
 `--imports` re-applies every session-loaded script into a **fresh** runspace in the
 sacrificial process before the command. Script bodies are cached on the agent by
-`powerpick-fork-load`; `--imports` only sends import names on the wire.
+`powerpick-load`; `--imports` only sends import names on the wire.
 
-`--spawnto` / `--imports` are parsed from the raw command line. A bare spawnto
-image name is expanded under `C:\Windows\System32\`.
+`--impersonate` spawns the sacrificial process with
+`CreateProcessAsUser` using the agent thread’s current impersonation token
+(e.g. after `steal_token` / `make_token`). Without it, the child runs as the
+agent’s primary identity. Errors if no thread token is present.
+
+`--spawnto` / `--imports` / `--impersonate` are parsed from the raw command line.
+A bare spawnto image name is expanded under `C:\Windows\System32\`.
+(`--spawnto` / `--impersonate` are fork-only.)
 
 ## Layout
 
@@ -96,7 +106,7 @@ Artifacts:
 | `_bin/powerpick-fork.x64.o` | Agent BOF |
 | `_bin/PowerPickForkHost.dll` | rundll32-hosted CLR host |
 | `_bin/PowerPickFork.exe` | Managed `exec <base64>` runner |
-| `powerpick-fork.axs` | Operator command |
+| `powerpick-fork.axs` | Operator commands (`powerpick` …) |
 
 Load `powerpick-fork.axs` in Adaptix. Registered for beacon / gopher / kharon,
 Windows x64.

