@@ -1,22 +1,11 @@
 # PowerPick-Fork (Adaptix)
 
-Fork-and-run PowerShell for AdaptixC2 agents. Runs the SMA host inside a
-**sacrificial Microsoft-signed process** so a CLR / PowerShell crash does not
-kill the agent.
+Fork-and-run PowerShell for AdaptixC2 agents via Unmanaged Powershell.
 Lab / authorized testing only.
 
 This tree is separate from inline PowerPick (`powerpick-bof`). Operator commands
 are the same (`powerpick`, `powerpick-load`, …) — **load only one** of the two
 AxScripts at a time.
-
-## How it differs from inline PowerPick
-
-| | Inline PowerPick | PowerPick-Fork |
-|---|---|---|
-| Where CLR runs | Inside the agent process | Sacrificial `rundll32` process |
-| Crash impact | Can kill the agent | Sacrificial process dies; agent continues |
-| Vessel | Agent image | Default `rundll32.exe` (configurable) |
-| Commands | `powerpick` / `powerpick-load` / `--imports` | Same |
 
 ## OPSEC
 
