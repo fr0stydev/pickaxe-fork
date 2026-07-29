@@ -15,6 +15,12 @@ The managed host applies a best-effort content-scan neutralize before SMA
 execution (helps with AMSI script blocking). It does **not** defeat ETW,
 script-block logging, or behavioral AV on `rundll32` / CLR load.
 
+**Managed PE:** loaded from the named mapping via `AppDomain::Load_3` +
+`EntryPoint`/`Invoke_3` (no managed EXE on disk). Hosted Havoc PowerPick-style.
+
+**Host DLL:** still staged briefly for classic `rundll32 "<dll>",PowerPickForkRun`,
+then deleted after the sacrificial process exits.
+
 
 ## Command
 

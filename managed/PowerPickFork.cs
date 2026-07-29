@@ -714,10 +714,20 @@ namespace PowerPickFork
             }
         }
 
+        // EntryPoint for AppDomain::Load_3 + Invoke_3 (Havoc-style).
+        // Host passes string[] { mapName }. Standalone: exec <base64>.
         public static int Main(string[] args)
         {
             try
             {
+                if (args != null &&
+                    args.Length == 1 &&
+                    !String.IsNullOrEmpty(args[0]) &&
+                    !String.Equals(args[0], "exec", StringComparison.OrdinalIgnoreCase))
+                {
+                    return RunFromMap(args[0]);
+                }
+
                 if (args == null ||
                     args.Length < 2 ||
                     !String.Equals(args[0], "exec", StringComparison.OrdinalIgnoreCase))
@@ -735,35 +745,6 @@ namespace PowerPickFork
                     "PowerShell host failed: {0}: {1}",
                     exception.GetType().FullName,
                     exception.Message);
-                return 1;
-            }
-        }
-
-        // Called via ICLRRuntimeHost.ExecuteInDefaultAppDomain.
-        // Argument is the payload map name (Local\...).
-        public static int ForkExec(string mapName)
-        {
-            try
-            {
-                return RunFromMap(mapName);
-            }
-            catch (Exception exception)
-            {
-                try
-                {
-                    SlotWriteLine(
-                        String.Format(
-                            "PowerShell host failed: {0}: {1}",
-                            exception.GetType().FullName,
-                            exception.Message));
-                }
-                catch
-                {
-                    Console.Error.WriteLine(
-                        "PowerShell host failed: {0}: {1}",
-                        exception.GetType().FullName,
-                        exception.Message);
-                }
                 return 1;
             }
         }
