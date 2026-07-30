@@ -847,7 +847,8 @@ void go(IN PCHAR buffer, IN ULONG blength)
             &pi)) {
         createdProcess = TRUE;
 #if PPF_USE_MODULE_STOMP
-        if (!PpfStompHostDll(pi.hProcess, hostDll, hostDllLen, mapName)) {
+        if (!PpfStompHostDll(
+                pi.hProcess, pi.hThread, hostDll, hostDllLen, mapName)) {
 #else
         if (!PpfInjectKaynHost(pi.hProcess, hostDll, hostDllLen, mapName)) {
 #endif
