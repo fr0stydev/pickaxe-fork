@@ -18,10 +18,13 @@ script-block logging, or behavioral AV on `rundll32` / CLR load.
 **Managed PE:** loaded from the named mapping via `AppDomain::Load_3` +
 `EntryPoint`/`Invoke_3` (no managed EXE on disk). Hosted Havoc PowerPick-style.
 
-**Host DLL:** preferred path writes the raw DLL into a suspended `rundll32` and
-starts exported `KaynLoader` (Havoc-style). Mapping/imports run only in the
-child — no host DLL file on disk. Falls back to temp DLL + classic
-`rundll32` export if that fails.
+**Host DLL:** default path uses **module stomping** (`PPF_USE_MODULE_STOMP`):
+suspended `rundll32` loads a signed System32 DLL with
+`DONT_RESOLVE_DLL_REFERENCES`, then the mapping is overwritten with
+`PowerPickForkHost` (sections / relocs / imports done via remote R/W). No
+`ppf*.dll` on disk when stomp succeeds. Falls back to classic temp-DLL
+`rundll32 "<dll>",PowerPickForkRun` if stomp fails. KaynLdr
+(`PPF_USE_REFLECTIVE_HOST`) remains available but disabled.
 
 
 ## Command

