@@ -472,16 +472,10 @@ __declspec(dllexport) void CALLBACK PowerPickForkRun(
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
 {
+    (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
+        /* Do not run CLR/host work here — loader lock. KaynLoader calls export after. */
         DisableThreadLibraryCalls(hinst);
-        /*
-         * Reflective path (KaynLoader): reserved is the map-name string.
-         * Normal rundll32 LoadLibrary passes reserved == NULL.
-         */
-        if (reserved != NULL) {
-            int code = RunHost((const char*)reserved);
-            ExitProcess((UINT)code);
-        }
     }
     return TRUE;
 }

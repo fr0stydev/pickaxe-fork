@@ -16,6 +16,8 @@
 #define SYS_LDRLOADDLL 0x9e456a43
 #define SYS_NTALLOCATEVIRTUALMEMORY 0xf783b8ec
 #define SYS_NTPROTECTEDVIRTUALMEMORY 0x50e92888
+/* djb2 of "ExitProcess" (Havoc-style hash) */
+#define SYS_EXITPROCESS 0xd154167e
 
 typedef struct _PPF_UNICODE_STRING {
     USHORT Length;
