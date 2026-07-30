@@ -18,8 +18,9 @@ script-block logging, or behavioral AV on `rundll32` / CLR load.
 **Managed PE:** loaded from the named mapping via `AppDomain::Load_3` +
 `EntryPoint`/`Invoke_3` (no managed EXE on disk). Hosted Havoc PowerPick-style.
 
-**Host DLL:** still staged briefly for classic `rundll32 "<dll>",PowerPickForkRun`,
-then deleted after the sacrificial process exits.
+**Host DLL:** preferred path reflectively maps the host into a suspended
+`rundll32` (no host DLL on disk; imports resolved only inside the child).
+Falls back to a short-lived temp DLL + classic `rundll32` export if reflect fails.
 
 
 ## Command
