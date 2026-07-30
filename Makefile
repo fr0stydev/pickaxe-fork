@@ -13,7 +13,7 @@ MANAGED := $(OUT)/PowerPickFork.exe
 
 CFLAGS_BOF := -Os -w -Wno-incompatible-pointer-types -I include \
 	-fno-stack-check -fno-stack-protector -mno-stack-arg-probe
-CFLAGS_HOST := -Os -w -I include -shared -static-libgcc
+CFLAGS_HOST := -Os -w -I include -I native -shared -static-libgcc
 LIBS_HOST := -loleaut32 -lshell32 -luser32 -lole32
 
 .PHONY: all bof host managed verify clean
@@ -25,14 +25,14 @@ $(OUT):
 
 bof: $(BOF)
 
-$(BOF): native/powerpick_fork.c native/powerpick_fork_reflect.h include/powerpick_fork_bof.h include/beacon.h | $(OUT)
+$(BOF): native/powerpick_fork.c native/powerpick_fork_kayn_inject.h include/powerpick_fork_bof.h include/beacon.h | $(OUT)
 	$(CC) $(CFLAGS_BOF) -c native/powerpick_fork.c -o $(BOF)
 	$(STRIP) --strip-unneeded $(BOF)
 
 host: $(HOST)
 
-$(HOST): native/powerpick_fork_host.c native/PowerPickForkHost.def include/powerpick_fork_clr.h | $(OUT)
-	$(CC) $(CFLAGS_HOST) native/powerpick_fork_host.c native/PowerPickForkHost.def -o $(HOST) $(LIBS_HOST)
+$(HOST): native/powerpick_fork_host.c native/kayn_ldr.c native/kayn_ldr.h native/PowerPickForkHost.def include/powerpick_fork_clr.h | $(OUT)
+	$(CC) $(CFLAGS_HOST) native/powerpick_fork_host.c native/kayn_ldr.c native/PowerPickForkHost.def -o $(HOST) $(LIBS_HOST)
 	$(STRIP) --strip-unneeded $(HOST)
 
 managed: $(MANAGED)
